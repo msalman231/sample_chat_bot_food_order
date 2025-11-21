@@ -2,12 +2,14 @@ import os
 import re
 import json
 import time
+import random
+import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from dotenv import load_dotenv
-import requests
+from pydantic import SecretStr
 from typing import List, Dict, Optional, Any
 
 # Load environment variables from .env file
@@ -48,7 +50,7 @@ def fetch_menu_data_from_graphql() -> Optional[Dict[str, Any]]:
     """
     
     try:
-        print("🔄 Fetching menu data from GraphQL...")
+        print("[INFO] Fetching menu data from GraphQL...")
         response = requests.post(
             GRAPHQL_URL,
             json={'query': query},
@@ -68,22 +70,22 @@ def fetch_menu_data_from_graphql() -> Optional[Dict[str, Any]]:
                 }
                 LAST_FETCH_TIME = current_time
                 
-                print(f"✅ Fetched {len(menu_items)} menu items from GraphQL")
-                print(f"📂 Categories: {MENU_DATA_CACHE['categories']}")
+                print(f"[SUCCESS] Fetched {len(menu_items)} menu items from GraphQL")
+                print(f"[INFO] Categories: {MENU_DATA_CACHE['categories']}")
                 
                 return MENU_DATA_CACHE
             else:
-                print("❌ Invalid GraphQL response structure")
+                print("[ERROR] Invalid GraphQL response structure")
                 return None
         else:
-            print(f"❌ GraphQL request failed with status {response.status_code}")
+            print(f"[ERROR] GraphQL request failed with status {response.status_code}")
             return None
             
     except requests.exceptions.RequestException as e:
-        print(f"❌ Error connecting to GraphQL server: {e}")
+        print(f"[ERROR] Error connecting to GraphQL server: {e}")
         return None
     except Exception as e:
-        print(f"❌ Error fetching menu data: {e}")
+        print(f"[ERROR] Error fetching menu data: {e}")
         return None
 
 def update_menu_items_from_graphql():
@@ -128,219 +130,57 @@ def get_menu_item_details(item_name: str) -> Optional[Dict]:
                 return item
     return None
 
-
 def find_menu_item_fuzzy_with_details(search_term: str) -> Optional[Dict]:
-    """Find menu item with enhanced fuzzy matching and return full details"""
+    """Find menu item with fuzzy matching and return full details"""
     search_term = search_term.lower().strip()
     menu_data = fetch_menu_data_from_graphql()
-    
-    print(f"🔍 Searching for: '{search_term}'")
     
     if not menu_data:
         # Fallback to simple name matching
         matched_name = find_menu_item_fuzzy(search_term)
-        print(f"📊 Using fallback data, found: {matched_name}")
         return {'name': matched_name, 'price': 12.99} if matched_name else None
     
-    available_items = [item for item in menu_data['items'] if item['available']]
-    print(f"📋 Available items: {[item['name'] for item in available_items[:5]]}...")
-    
-    # 1. EXACT MATCH (highest priority)
-    for item in available_items:
-        if item['name'].lower() == search_term:
-            print(f"✅ EXACT match: '{search_term}' -> '{item['name']}'")
+    # Exact match first
+    for item in menu_data['items']:
+        if item['available'] and item['name'].lower() == search_term:
             return item
     
-    # 2. EXACT MATCH with common variations
-    search_variations = [
-        search_term,
-        search_term.replace('salad', 'salads'),
-        search_term.replace('salads', 'salad'),
-        search_term + ' salad' if 'salad' not in search_term else search_term,
-        search_term.replace(' salad', '').replace(' salads', '') + ' salad'
-    ]
+    # Partial match (search term in menu item)
+    for item in menu_data['items']:
+        if item['available'] and search_term in item['name'].lower():
+            return item
     
-    for variation in search_variations:
-        for item in available_items:
-            if item['name'].lower() == variation.lower():
-                print(f"✅ VARIATION match: '{search_term}' -> '{item['name']}'")
+    # Reverse partial match (menu item in search term)
+    for item in menu_data['items']:
+        if item['available'] and item['name'].lower() in search_term:
+            return item
+    
+    # Space-normalized match
+    search_normalized = search_term.replace(' ', '')
+    for item in menu_data['items']:
+        if item['available']:
+            item_normalized = item['name'].lower().replace(' ', '')
+            if search_normalized == item_normalized:
                 return item
     
-    # 3. STARTS WITH match (very high priority)
-    for item in available_items:
-        item_name_lower = item['name'].lower()
-        if item_name_lower.startswith(search_term) or search_term.startswith(item_name_lower):
-            print(f"✅ STARTS WITH match: '{search_term}' -> '{item['name']}'")
-            return item
-    
-    # 4. CONTAINS match (search term in menu item - high priority)
-    best_matches = []
-    for item in available_items:
-        item_name_lower = item['name'].lower()
-        if search_term in item_name_lower:
-            # Calculate match score based on how much of the item name matches
-            score = len(search_term) / len(item_name_lower)
-            best_matches.append((item, score))
-            print(f"📝 CONTAINS match: '{search_term}' in '{item['name']}' (score: {score:.2f})")
-    
-    if best_matches:
-        # Sort by score and return the best match
-        best_matches.sort(key=lambda x: x[1], reverse=True)
-        best_item = best_matches[0][0]
-        print(f"✅ BEST CONTAINS match: '{search_term}' -> '{best_item['name']}'")
-        return best_item
-    
-    # 5. REVERSE CONTAINS match (menu item name in search term)
-    for item in available_items:
-        item_name_lower = item['name'].lower()
-        if item_name_lower in search_term:
-            print(f"✅ REVERSE CONTAINS match: '{item['name']}' in '{search_term}'")
-            return item
-    
-    # 6. WORD-by-WORD matching
-    search_words = search_term.split()
-    word_matches = []
-    
-    for item in available_items:
-        item_words = item['name'].lower().split()
-        matches = 0
-        total_words = len(search_words)
-        
-        for search_word in search_words:
-            for item_word in item_words:
-                if search_word in item_word or item_word in search_word:
-                    matches += 1
-                    break
-        
-        if matches > 0:
-            score = matches / total_words
-            word_matches.append((item, score, matches))
-            print(f"🎯 WORD match: '{search_term}' -> '{item['name']}' ({matches}/{total_words} words, score: {score:.2f})")
-    
-    if word_matches:
-        # Sort by number of matches first, then by score
-        word_matches.sort(key=lambda x: (x[2], x[1]), reverse=True)
-        best_item = word_matches[0][0]
-        print(f"✅ BEST WORD match: '{search_term}' -> '{best_item['name']}'")
-        return best_item
-    
-    # 7. SPACE-NORMALIZED matching
-    search_normalized = search_term.replace(' ', '').replace('-', '').replace('_', '')
-    for item in available_items:
-        item_normalized = item['name'].lower().replace(' ', '').replace('-', '').replace('_', '')
-        if search_normalized == item_normalized:
-            print(f"✅ NORMALIZED match: '{search_term}' -> '{item['name']}'")
-            return item
-        elif search_normalized in item_normalized or item_normalized in search_normalized:
-            print(f"✅ NORMALIZED PARTIAL match: '{search_term}' -> '{item['name']}'")
-            return item
-    
-    # 8. ENHANCED SYNONYM/ALIAS matching
-    enhanced_synonyms = {
-        # Salad variations
-        'garden salad': ['Garden Salad', 'Fresh Garden Salad', 'Mixed Garden Salad', 'House Salad'],
-        'garden salads': ['Garden Salad', 'Fresh Garden Salad', 'Mixed Garden Salad'],
-        'garden': ['Garden Salad', 'Fresh Garden Salad'],
-        'greek salad': ['Greek Salad', 'Mediterranean Salad'],
-        'greek salads': ['Greek Salad', 'Mediterranean Salad'],
-        'caesar salad': ['Caesar Salad', 'Chicken Caesar Salad', 'Classic Caesar'],
-        'caesar salads': ['Caesar Salad', 'Chicken Caesar Salad'],
-        
-        # Pizza variations
-        'margherita pizza': ['Margherita Pizza', 'Margherita', 'Classic Margherita'],
-        'margherita': ['Margherita Pizza', 'Classic Margherita'],
-        'pepperoni pizza': ['Pepperoni Pizza', 'Pepperoni'],
-        'pepperoni': ['Pepperoni Pizza'],
-        
-        # Beverage variations
-        'coke': ['Coca Cola', 'Coke', 'Coca-Cola'],
-        'coca cola': ['Coca Cola', 'Coke'],
-        'pepsi': ['Pepsi', 'Pepsi Cola'],
-        'orange juice': ['Orange Juice', 'Fresh Orange Juice', 'Orange Juice Can'],
-        'orange': ['Orange Juice', 'Fresh Orange Juice'],
-        'apple juice': ['Apple Juice', 'Apple Juice Can', 'Fresh Apple Juice'],
-        'apple': ['Apple Juice', 'Apple Juice Can'],
-        'water': ['Water', 'Water Bottle', 'Still Water'],
-        'water bottle': ['Water Bottle', 'Water'],
-        
-        # Pasta variations
-        'spaghetti': ['Spaghetti Carbonara', 'Spaghetti', 'Spaghetti Bolognese'],
-        'pasta': ['Spaghetti Carbonara', 'Penne Arrabbiata', 'Fettuccine Alfredo'],
-        'carbonara': ['Spaghetti Carbonara'],
-        'alfredo': ['Fettuccine Alfredo'],
-        
-        # Fish variations
-        'fish and chips': ['Fish and Chips', 'Fish & Chips', 'Beer Battered Fish'],
-        'fish': ['Fish and Chips', 'Grilled Salmon', 'Seafood Platter'],
-        'salmon': ['Grilled Salmon', 'Atlantic Salmon'],
-        
-        # Dessert variations
-        'chocolate cake': ['Chocolate Cake', 'Rich Chocolate Cake', 'Dark Chocolate Cake'],
-        'cake': ['Chocolate Cake', 'Cheesecake', 'Rich Chocolate Cake'],
-        'ice cream': ['Ice Cream', 'Vanilla Ice Cream', 'Chocolate Ice Cream'],
-        'tiramisu': ['Tiramisu', 'Classic Tiramisu'],
+    # Common variations and synonyms with GraphQL data
+    synonyms = {
+        'apple juice can': 'Apple Juice Can',
+        'fresh orange juice': 'Fresh Orange Juice',
+        'water bottle': 'Water Bottle',
+        'coke': 'Coca Cola',
+        'pepsi cola': 'Pepsi',
+        'orange': 'Fresh Orange Juice',
+        'apple': 'Apple Juice Can'
     }
     
-    # Check if search term matches any synonym
-    if search_term in enhanced_synonyms:
-        possible_names = enhanced_synonyms[search_term]
-        for possible_name in possible_names:
-            for item in available_items:
-                if item['name'].lower() == possible_name.lower():
-                    print(f"✅ SYNONYM match: '{search_term}' -> '{item['name']}' (via synonym)")
-                    return item
+    if search_term in synonyms:
+        synonym_name = synonyms[search_term]
+        for item in menu_data['items']:
+            if item['available'] and item['name'].lower() == synonym_name.lower():
+                return item
     
-    # Check if search term is part of any synonym key
-    for synonym_key, possible_names in enhanced_synonyms.items():
-        if search_term in synonym_key or synonym_key in search_term:
-            for possible_name in possible_names:
-                for item in available_items:
-                    if item['name'].lower() == possible_name.lower():
-                        print(f"✅ SYNONYM PARTIAL match: '{search_term}' -> '{item['name']}' (via '{synonym_key}')")
-                        return item
-    
-    # 9. FUZZY CHARACTER matching (for typos)
-    fuzzy_matches = []
-    for item in available_items:
-        item_name_lower = item['name'].lower()
-        
-        # Simple Levenshtein-like distance
-        def simple_distance(s1, s2):
-            if len(s1) < len(s2):
-                return simple_distance(s2, s1)
-            if len(s2) == 0:
-                return len(s1)
-            
-            previous_row = list(range(len(s2) + 1))
-            for i, c1 in enumerate(s1):
-                current_row = [i + 1]
-                for j, c2 in enumerate(s2):
-                    insertions = previous_row[j + 1] + 1
-                    deletions = current_row[j] + 1
-                    substitutions = previous_row[j] + (c1 != c2)
-                    current_row.append(min(insertions, deletions, substitutions))
-                previous_row = current_row
-            return previous_row[-1]
-        
-        distance = simple_distance(search_term, item_name_lower)
-        max_length = max(len(search_term), len(item_name_lower))
-        similarity = 1 - (distance / max_length)
-        
-        # Only consider items with high similarity (> 70%)
-        if similarity > 0.7:
-            fuzzy_matches.append((item, similarity))
-            print(f"🎯 FUZZY match: '{search_term}' -> '{item['name']}' (similarity: {similarity:.2f})")
-    
-    if fuzzy_matches:
-        # Sort by similarity and return the best match
-        fuzzy_matches.sort(key=lambda x: x[1], reverse=True)
-        best_item = fuzzy_matches[0][0]
-        print(f"✅ BEST FUZZY match: '{search_term}' -> '{best_item['name']}'")
-        return best_item
-    
-    print(f"❌ NO match found for: '{search_term}'")
     return None
-
 
 app = Flask(__name__)
 CORS(app)
@@ -361,13 +201,23 @@ try:
     base_url = os.getenv("OPENAI_BASE_URL")
     api_key = os.getenv("GITHUB_TOKEN") or os.getenv("OPENAI_API_KEY")
     
-    # Fix: Handle the SecretStr type requirement for newer LangChain versions
-    llm = ChatOpenAI(
-        model=os.getenv("OPENAI_MODEL", "openai/gpt-4o-mini"),
-        temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.2")),
-        base_url=base_url,
-        api_key=api_key  # Changed from 'openai_api_key' to 'api_key' for newer LangChain versions
-    )
+    # Only initialize llm if we have an API key
+    if api_key and api_key != "your-openai-api-key-here":
+        # Note: There are type checking issues with SecretStr, but the functionality works
+        # For GitHub Models, use the model name without the "openai/" prefix
+        model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        if model_name.startswith("openai/"):
+            model_name = model_name.replace("openai/", "")
+        
+        llm = ChatOpenAI(
+            model=model_name,
+            temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.2")),
+            base_url=base_url,
+            api_key=api_key  # Type checking issue here, but functionality works
+        )
+    else:
+        llm = None
+        print("OpenAI API key not provided, running in fallback mode")
 except Exception as e:
     print(f"Error initializing OpenAI client: {e}")
     llm = None
@@ -405,12 +255,240 @@ def clean_response_formatting(text):
     
     return cleaned
 
+def _make_human_comment_for_item(item: Dict[str, Any], emotional_state: Dict = None) -> str:
+    """Create a short human-like positive comment for a menu item, adapted for emotional state."""
+    if not item:
+        return "A great choice — many customers love this!"
+    
+    category = item.get('category', '').lower()
+    emotion = emotional_state.get('emotion', 'neutral') if emotional_state else 'neutral'
+    
+    # Emotional context-based comments
+    if emotion in ['very_negative', 'negative', 'crisis']:
+        if 'dessert' in category:
+            return "Sometimes a little sweetness can bring comfort during tough times. This is especially loved by customers."
+        elif 'pizza' in category:
+            return "Warm, cheesy comfort food that feels like a hug. Many find this particularly soothing."
+        elif 'pasta' in category:
+            return "Warm, hearty, and comforting — like a bowl of love. Perfect for difficult days."
+        elif 'beverage' in category and ('tea' in item.get('name', '').lower() or 'coffee' in item.get('name', '').lower()):
+            return "Warm and soothing — sometimes a comforting drink is exactly what we need."
+        elif 'salad' in category:
+            return "Fresh and nourishing — taking care of yourself with good food is important."
+    
+    elif emotion == 'lonely':
+        if 'pizza' in category:
+            return "Perfect for enjoying while watching something comforting — you're not alone."
+        elif 'dessert' in category:
+            return "A little treat for yourself because you deserve something sweet."
+        else:
+            return "A wonderful choice to enjoy — I hope it brings you some warmth."
+    
+    elif emotion == 'unwell':
+        if 'beverage' in category:
+            return "Gentle and soothing — perfect when you're not feeling your best."
+        elif 'salad' in category:
+            return "Light and nourishing — easy on the stomach when you're recovering."
+        elif 'pasta' in category:
+            return "Comforting and easy to digest — great for when you need gentle nourishment."
+    
+    elif emotion in ['positive', 'celebratory']:
+        if 'dessert' in category:
+            return "Perfect for celebrating! Life's good moments deserve something sweet."
+        elif 'pizza' in category:
+            return "Excellent choice for a great day — enjoy every delicious bite!"
+        else:
+            return "Fantastic pick for someone in such a great mood!"
+    
+    # Original logic for neutral emotional state
+    desc = item.get('description') or (', '.join(item.get('ingredients', [])) if item.get('ingredients') else '')
+    if desc:
+        first_sentence = desc.split('.')[0].strip()
+        if first_sentence:
+            return f"{first_sentence.capitalize()}. A popular pick!"
+    
+    # Category-based fallback
+    if 'pizza' in category:
+        return "Cheesy, flavorful and perfect to share — a crowd favorite!"
+    if 'salad' in category:
+        return "Fresh and crisp — great if you're craving something light."
+    if 'dessert' in category:
+        return "Sweet finish — customers often save room for this."
+    if 'seafood' in category:
+        return "Delicately seasoned and cooked to perfection."
+    if 'beverage' in category:
+        return "Refreshing and pairs well with meals."
+    
+    return "A tasty choice — many customers enjoy this!"
+
+def detect_emotional_state(user_message):
+    """Detect user's emotional state with intensity and specific emotions"""
+    lower_message = user_message.lower()
+    
+    # Comprehensive emotional vocabulary
+    emotional_indicators = {
+        'very_negative': {
+            'keywords': ['devastated', 'destroyed', 'ruined', 'hopeless', 'suicide', 'kill myself', 'end it all', 'can\'t take it', 'hate my life', 'want to die'],
+            'intensity': 'very_high',
+            'emotion': 'crisis'
+        },
+        'negative_high': {
+            'keywords': ['worst day ever', 'horrible', 'terrible', 'awful', 'miserable', 'depressed', 'devastated', 'heartbroken', 'furious', 'livid'],
+            'intensity': 'high',
+            'emotion': 'very_negative'
+        },
+        'negative_medium': {
+            'keywords': ['sad', 'upset', 'angry', 'frustrated', 'disappointed', 'stressed', 'worried', 'anxious', 'down', 'blue', 'tired', 'exhausted'],
+            'intensity': 'medium',
+            'emotion': 'negative'
+        },
+        'negative_low': {
+            'keywords': ['bad day', 'not great', 'could be better', 'meh', 'okay i guess', 'not feeling it', 'bit down'],
+            'intensity': 'low',
+            'emotion': 'slightly_negative'
+        },
+        'positive': {
+            'keywords': ['happy', 'great', 'awesome', 'fantastic', 'wonderful', 'excited', 'amazing', 'perfect', 'love', 'best day'],
+            'intensity': 'high',
+            'emotion': 'positive'
+        },
+        'celebratory': {
+            'keywords': ['celebrating', 'birthday', 'anniversary', 'promotion', 'got the job', 'engaged', 'married', 'graduation'],
+            'intensity': 'high',
+            'emotion': 'celebratory'
+        },
+        'lonely': {
+            'keywords': ['alone', 'lonely', 'no one cares', 'by myself', 'isolated', 'no friends', 'nobody understands'],
+            'intensity': 'medium',
+            'emotion': 'lonely'
+        },
+        'sick': {
+            'keywords': ['sick', 'ill', 'not feeling well', 'under the weather', 'flu', 'cold', 'fever', 'headache'],
+            'intensity': 'medium',
+            'emotion': 'unwell'
+        }
+    }
+    
+    detected_emotions = []
+    for category, data in emotional_indicators.items():
+        for keyword in data['keywords']:
+            if keyword in lower_message:
+                detected_emotions.append({
+                    'category': category,
+                    'keyword': keyword,
+                    'intensity': data['intensity'],
+                    'emotion': data['emotion']
+                })
+    
+    # Return the most intense emotion found, or neutral
+    if detected_emotions:
+        # Sort by intensity priority
+        intensity_order = {'very_high': 4, 'high': 3, 'medium': 2, 'low': 1}
+        detected_emotions.sort(key=lambda x: intensity_order.get(x['intensity'], 0), reverse=True)
+        return detected_emotions[0]
+    
+    return {'emotion': 'neutral', 'intensity': 'none', 'category': 'neutral'}
+
+def generate_empathetic_response(emotional_state, user_name=None, context='greeting'):
+    """Generate appropriate empathetic responses based on emotional state"""
+    emotion = emotional_state.get('emotion', 'neutral')
+    intensity = emotional_state.get('intensity', 'none')
+    
+    name_prefix = f"{user_name}, " if user_name else ""
+    
+    if emotion == 'crisis':
+        return f"I'm deeply concerned about you, {name_prefix}and I want you to know that you matter. Please consider reaching out to someone you trust or a mental health professional. In the meantime, let me help you with some comfort food - sometimes a warm meal can provide a small moment of comfort during difficult times."
+    
+    elif emotion == 'very_negative':
+        responses = [
+            f"I'm so sorry you're going through such a tough time, {name_prefix}My heart goes out to you. Would you like me to suggest something particularly comforting from our menu? Sometimes a favorite dish can bring a tiny bit of warmth to a difficult day.",
+            f"That sounds incredibly hard, {name_prefix}I wish I could give you a hug right now. Let me at least help you with some soul-warming food. What usually brings you comfort when you're feeling this way?"
+        ]
+        return random.choice(responses)
+    
+    elif emotion == 'negative' and intensity == 'high':
+        responses = [
+            f"I can hear that you're really struggling right now, {name_prefix}I'm here for you. Would you like me to recommend something especially comforting? Sometimes the right meal can be a small act of self-care.",
+            f"I'm really sorry you're having such a difficult time, {name_prefix}You deserve some kindness, especially from yourself. Let me help you find something delicious that might brighten your day just a little."
+        ]
+        return random.choice(responses)
+    
+    elif emotion == 'negative':
+        responses = [
+            f"I'm sorry you're not feeling your best today, {name_prefix}I hope I can help make things a little better. What sounds good to you right now?",
+            f"I can sense you're having a rough time, {name_prefix}Let me help you find something that might lift your spirits. What kind of flavors usually comfort you?"
+        ]
+        return random.choice(responses)
+    
+    elif emotion == 'slightly_negative':
+        responses = [
+            f"I hope your day gets better, {name_prefix}Sometimes a good meal can help turn things around. What are you in the mood for?",
+            f"Sorry to hear things aren't going great, {name_prefix}Let's find you something delicious to help improve your day!"
+        ]
+        return random.choice(responses)
+    
+    elif emotion == 'lonely':
+        responses = [
+            f"You're not alone right now, {name_prefix}I'm here with you, and I care about making sure you get something wonderful to eat. Tell me what sounds good?",
+            f"I'm glad you're here with me, {name_prefix}Let's find you something special. Sometimes sharing a meal (even virtually) can feel less lonely."
+        ]
+        return random.choice(responses)
+    
+    elif emotion == 'unwell':
+        responses = [
+            f"Oh no, I hope you feel better soon, {name_prefix}When you're not feeling well, it's important to nourish yourself. Would you like something light and comforting, or something more substantial?",
+            f"I'm sorry you're not feeling well, {name_prefix}Let me help you find something gentle on the stomach but still delicious. What usually helps when you're under the weather?"
+        ]
+        return random.choice(responses)
+    
+    elif emotion == 'positive':
+        responses = [
+            f"I love your positive energy, {name_prefix}It's wonderful to chat with someone who's having a great day! What delicious food would make your day even better?",
+            f"Your happiness is contagious, {name_prefix}Let's celebrate your good mood with some amazing food! What are you craving?"
+        ]
+        return random.choice(responses)
+    
+    elif emotion == 'celebratory':
+        responses = [
+            f"Congratulations, {name_prefix}That's fantastic news! This calls for something special. What would make this celebration perfect?",
+            f"How exciting, {name_prefix}I'm so happy for you! Let's make this celebration delicious. What's your favorite way to treat yourself?"
+        ]
+        return random.choice(responses)
+    
+    else:  # neutral
+        if user_name:
+            return f"Hello, {user_name}! I'm here to help you find something delicious. How are you feeling today?"
+        else:
+            return "Hello! I'm here to help you with your order. How are you doing today?"
+
 def detect_intent_and_create_action(user_message, response_text):
-    """Enhanced detect user intent and create appropriate action when JSON parsing fails"""
+    """Detect user intent and create appropriate action when JSON parsing fails"""
     lower_message = user_message.lower()
     
     print(f"🔍 Analyzing message: '{user_message}'")
     
+    # --- EMPATHETIC GREETING WITH EMOTIONAL INTELLIGENCE ---
+    if any(greet in lower_message for greet in ['hi', 'hello', 'hey', 'hiya', 'good morning', 'good afternoon', 'good evening', 'yo']):
+        # Extract name if present
+        name_match = re.search(r'^(?:hi|hello|hey|hiya|yo|good morning|good afternoon|good evening)[,!\s]*(?:i\'m\s+|i am\s+|here[,!\s]*|my name is\s+)?([A-Za-z][A-Za-z\-]{0,30})', user_message, re.IGNORECASE)
+        name = name_match.group(1).strip().capitalize() if name_match else None
+        
+        # Detect emotional state
+        emotional_state = detect_emotional_state(user_message)
+        
+        # Generate empathetic response
+        response_text = generate_empathetic_response(emotional_state, name, 'greeting')
+        
+        return {
+            "action": "greeting",
+            "message_type": "text",
+            "greeting_name": name,
+            "emotional_state": emotional_state,
+            "response_text": response_text,
+            "response_delay": 800
+        }
+    # --- end empathetic greeting detection ---
+
     # Detect clear chat commands FIRST
     if any(phrase in lower_message for phrase in ['clear chat', 'clear conversation', 'reset chat', 'start over', 'new conversation']):
         return {
@@ -423,13 +501,16 @@ def detect_intent_and_create_action(user_message, response_text):
     if any(phrase in lower_message for phrase in ['show my cart', 'show cart', 'view cart', 'my cart', 'cart contents', 'what\'s in my cart']):
         return {
             "action": "show_cart",
-            "message_type": "cart",
+            "message_type": "text",
             "response_delay": 1000
         }
     
     # PRIORITY 1: Detect REMOVE ALL commands first (before other patterns)
+    # Enhanced remove all patterns with better specificity
     remove_all_patterns = [
+        # "Remove all [item]" or "Remove all [item] from cart"
         r'\b(?:remove|delete|cancel|take\s+out)\s+all\s+([a-zA-Z\s]+?)(?:\s+from\s+cart)?(?:\s|$)',
+        # "Remove all of [item]" or "Remove all of [item] from cart"
         r'\b(?:remove|delete|cancel|take\s+out)\s+all\s+of\s+([a-zA-Z\s]+?)(?:\s+from\s+cart)?(?:\s|$)'
     ]
     
@@ -445,98 +526,377 @@ def detect_intent_and_create_action(user_message, response_text):
                 print(f"✅ Found item to remove all: '{item_details['name']}'")
                 return {
                     "action": "remove_all",
-                    "message_type": "cart",
+                    "message_type": "text",
                     "target_item": item_details['name'],
                     "response_delay": 1000
                 }
             else:
                 print(f"❌ Item not found for remove all: '{item_name}'")
     
-    # PRIORITY 2: Enhanced DIRECT ITEM ADDITION patterns
-    # More comprehensive patterns to catch various ways users might add items
-    direct_item_patterns = [
-        # Pattern 1: "I want [quantity] [item name]"
-        r'\bi\s+want\s+(?!(to\s+order\s*$))(\d+)\s+([a-zA-Z\s]+?)(?:\s|$)',
-        # Pattern 2: "I want [item name]" (not empty order)
-        r'\bi\s+want\s+(?!(to\s+order\s*$))(?!\d+\s+)([a-zA-Z\s]+?)(?:\s|$|\.)',
-        # Pattern 3: "Add [quantity] [item name]" (not "add more")
-        r'\b(?:add)\s+(?!more\b)(\d+)\s+([a-zA-Z\s]+?)(?:\s|$|\.)',
-        # Pattern 4: "Add [item name]" (not "add more")
-        r'\b(?:add)\s+(?!more\b)(?!\d+\s+more\b)([a-zA-Z\s]+?)(?:\s|$|\.)',
-        # Pattern 5: "Get me [quantity] [item name]"
-        r'\bget\s+me\s+(\d+)\s+([a-zA-Z\s]+?)(?:\s|$|\.)',
-        # Pattern 6: "Get me [item name]"
-        r'\bget\s+me\s+(?!\d+\s+)([a-zA-Z\s]+?)(?:\s|$|\.)',
-        # Pattern 7: "Order [quantity] [item name]"
-        r'\border\s+(\d+)\s+([a-zA-Z\s]+?)(?:\s|$|\.)',
-        # Pattern 8: "Order [item name]"
-        r'\border\s+(?!\d+\s+)([a-zA-Z\s]+?)(?:\s|$|\.)',
-        # Pattern 9: "Can I have [quantity] [item name]"
-        r'\bcan\s+i\s+have\s+(\d+)\s+([a-zA-Z\s]+?)(?:\s|$|\.)',
-        # Pattern 10: "Can I have [item name]"
-        r'\bcan\s+i\s+have\s+(?!\d+\s+)([a-zA-Z\s]+?)(?:\s|$|\.)',
-        # Pattern 11: "Can I get [quantity] [item name]"
-        r'\bcan\s+i\s+get\s+(\d+)\s+([a-zA-Z\s]+?)(?:\s|$|\.)',
-        # Pattern 12: "Can I get [item name]"
-        r'\bcan\s+i\s+get\s+(?!\d+\s+)([a-zA-Z\s]+?)(?:\s|$|\.)',
-        # Pattern 13: "[quantity] [item name]" (simple format)
-        r'^\s*(\d+)\s+([a-zA-Z\s]+?)(?:\s|$|\.|please)',
-        # Pattern 14: Just "[item name]" (simple format)
-        r'^(?!\s*(?:show|display|see|view|list)\s)([a-zA-Z][a-zA-Z\s]+?)(?:\s*(?:please|\.)?)?$'
+    # PRIORITY 2: Detect REMOVE commands (with quantities)
+    # Enhanced remove patterns with better specificity - order matters!
+    remove_patterns = [
+        # "Remove the [quantity] quantity of [item]" or "Remove [quantity] quantity of [item]" (MOST SPECIFIC FIRST)
+        r'\b(?:remove|delete)\s+(?:the\s+)?(\d+)\s+quantity\s+of\s+([a-zA-Z\s]+?)(?:\s|$)',
+        # "Remove [item] by [quantity]"
+        r'\b(?:remove|delete)\s+([a-zA-Z\s]+?)\s+by\s+(\d+)\b',
+        # "Remove [quantity] [item]" (but not if it's "quantity of") - GREEDY match for full item names
+        r'\b(?:remove|delete|cancel|take\s+out)\s+(\d+)\s+(?!quantity\s+of)(.+?)(?:\s*$)',
+        # "Remove the [item]" (with "the" prefix, no quantity)
+        r'\b(?:remove|delete|cancel)\s+the\s+([a-zA-Z\s]+?)(?:\s+from\s+cart)?(?:\s|$)',
+        # "Remove [item]" (simple form, no quantity, no "the") - GREEDY match
+        r'\b(?:remove|delete|cancel)\s+(.+?)(?:\s+from\s+cart)?(?:\s*$)',
+        # "Take out [quantity] [item]" - GREEDY match
+        r'\btake\s+out\s+(?:(\d+)\s+)?(.+?)(?:\s*$)'
     ]
     
-    # Test direct item patterns with enhanced logging
-    for i, pattern in enumerate(direct_item_patterns, 1):
+    for pattern in remove_patterns:
+        remove_match = re.search(pattern, lower_message, re.IGNORECASE)
+        if remove_match:
+            print(f"🗑️ Remove pattern matched: '{pattern}' with groups: {remove_match.groups()}")
+            
+            # Handle different pattern formats based on the pattern structure
+            if 'quantity\\s+of' in pattern:
+                # Pattern: "remove [quantity] quantity of [item]"
+                quantity = int(remove_match.group(1))
+                item_name = remove_match.group(2).strip()
+            elif 'by' in pattern:
+                # Pattern: "remove [item] by [quantity]"
+                item_name = remove_match.group(1).strip()
+                quantity = int(remove_match.group(2))
+            elif '(\\d+)\\s+(?!quantity\\s+of)(.+?)' in pattern:
+                # Pattern: "remove [quantity] [item]" (new greedy pattern)
+                quantity = int(remove_match.group(1))
+                item_name = remove_match.group(2).strip()
+            elif 'take\\s+out' in pattern and len(remove_match.groups()) == 2:
+                # Pattern: "take out [quantity] [item]"
+                quantity_str = remove_match.group(1)
+                item_name = remove_match.group(2).strip()
+                quantity = int(quantity_str) if quantity_str else 1
+            else:
+                # Simple patterns: "remove [item]" or "remove the [item]"
+                item_name = remove_match.group(1).strip() if remove_match.group(1) else ""
+                quantity = 1
+            
+            print(f"🗑️ Remove detected: '{item_name}' (quantity: {quantity})")
+            
+            # Find the exact menu item
+            item_details = find_menu_item_fuzzy_with_details(item_name)
+            if item_details:
+                print(f"✅ Found item to remove: '{item_details['name']}'")
+                # Always use "update" action for quantity-based removal
+                return {
+                    "action": "update",
+                    "message_type": "text",
+                    "operation": "decrease",
+                    "target_item": item_details['name'],
+                    "quantity": quantity,
+                    "response_delay": 1000
+                }
+            else:
+                print(f"❌ Item not found for removal: '{item_name}'")
+    
+    # PRIORITY 3: Detect DECREASE commands (before add patterns)
+    decrease_patterns = [
+        r'\b(?:decrease|reduce)\s+([a-zA-Z\s]+?)\s+(?:by\s+)?(\d+)\b',
+        r'\b(?:decrease|reduce)\s+(?:the\s+)?([a-zA-Z\s]+?)\s+(?:by\s+)?(\d+)\b'
+    ]
+    
+    for pattern in decrease_patterns:
+        decrease_match = re.search(pattern, lower_message, re.IGNORECASE)
+        if decrease_match:
+            item_name = decrease_match.group(1).strip()
+            quantity = int(decrease_match.group(2))
+            
+            print(f"⬇️ Decrease detected: '{item_name}' by {quantity}")
+            
+            # Find the exact menu item
+            item_details = find_menu_item_fuzzy_with_details(item_name)
+            if item_details:
+                print(f"✅ Found item to decrease: '{item_details['name']}'")
+                return {
+                    "action": "update",
+                    "message_type": "text",
+                    "operation": "decrease",
+                    "target_item": item_details['name'],
+                    "quantity": quantity,
+                    "response_delay": 1000
+                }
+            else:
+                print(f"❌ Item not found for decrease: '{item_name}'")
+    
+    # PRIORITY 4: Detect INCREASE/ADD MORE commands
+    increase_patterns = [
+        # "Add [quantity] more [item]"
+        r'\b(?:add)\s+(?:(\d+)\s+)?(?:more)\s+([a-zA-Z\s]+?)(?:\s|$)',
+        # "Increase [item] by [quantity]"
+        r'\b(?:increase)\s+([a-zA-Z\s]+?)\s+(?:by\s+)?(\d+)\b',
+        # "Add more [item]"
+        r'\b(?:add)\s+(?:more)\s+([a-zA-Z\s]+?)(?:\s|$)'
+    ]
+    
+    for pattern in increase_patterns:
+        increase_match = re.search(pattern, lower_message, re.IGNORECASE)
+        if increase_match:
+            if len(increase_match.groups()) == 2 and increase_match.group(2):
+                if 'by' in pattern:
+                    item_name = increase_match.group(1).strip()
+                    quantity = int(increase_match.group(2))
+                else:
+                    quantity_str = increase_match.group(1)
+                    item_name = increase_match.group(2).strip()
+                    quantity = int(quantity_str) if quantity_str else 1
+            else:
+                item_name = increase_match.group(1).strip()
+                quantity = 1
+            
+            print(f"⬆️ Increase detected: '{item_name}' by {quantity}")
+            
+            return {
+                "action": "update",
+                "message_type": "text",
+                "operation": "increase",
+                "target_item": item_name,
+                "quantity": quantity,
+                "response_delay": 1000
+            }
+    
+    # Check if "I want to order" is followed by specific items/quantities
+    # This should be processed as multi-category, not order placement
+    if "i want to order" in lower_message:
+        # Extract everything after "i want to order"
+        order_match = re.search(r'i\s+want\s+to\s+order\s+(.+)', lower_message)
+        if order_match:
+            order_content = order_match.group(1)
+            # Check if it contains quantities and categories (not empty order)
+            has_quantities = bool(re.search(r'\d+\s+(?:pizza|pasta|salad|dessert|beverage|seafood|appetizer|main)', order_content))
+            if has_quantities:
+                # Process as multi-category order, continue to multi-category detection
+                pass
+            else:
+                # Empty "I want to order" - treat as order placement
+                return {
+                    "action": "place_order",
+                    "message_type": "text",
+                    "order_id": f"ORD-{int(time.time())}",
+                    "response_delay": 1500
+                }
+    
+    # Detect order placement commands (only when no quantities/items specified)
+    order_placement_phrases = ['place order', 'place my order', 'order this', 'checkout', 'order now', 'complete order', 'proceed with order']
+    if any(phrase in lower_message for phrase in order_placement_phrases):
+        # Ask for explicit confirmation in the UI before placing
+        return {
+            "action": "place_order",
+            "message_type": "text",
+            "response_text": "Would you like to proceed to place your order?",
+            "response_delay": 300
+        }
+
+    # PRIORITY 5: Detect direct item addition (but avoid conflicts with remove/decrease)
+    # Enhanced patterns to avoid matching remove/decrease commands
+    direct_item_patterns = [
+        # Pattern 1: "Add [quantity] [item name]" (not "add more")
+        r'\b(?:add)\s+(?!more\b)(\d+)\s+([a-zA-Z\s]+?)(?:\s|$)',
+        # Pattern 2: "Add [item name]" (not "add more")
+        r'\b(?:add)\s+(?!more\b)(?!\d+\s+more\b)([a-zA-Z\s]+?)(?:\s|$)',
+        # Pattern 3: "I want [quantity] of [item name]" or "I want [quantity] [item name]"
+        r'\bi\s+want\s+(?!(to\s+order\s*$))(\d+)\s+(?:of\s+)?([a-zA-Z\s]+?)(?:\s|$)',
+        # Pattern 4: "I want [item name]" (not empty order)
+        r'\bi\s+want\s+(?!(to\s+order\s*$))(?!\d+\s+)([a-zA-Z\s]+?)(?:\s|$)',
+        # Pattern 5: "Get me [quantity] [item name]"
+        r'\bget\s+me\s+(\d+)\s+([a-zA-Z\s]+?)(?:\s|$)',
+        # Pattern 6: "Get me [item name]"
+        r'\bget\s+me\s+(?!\d+\s+)([a-zA-Z\s]+?)(?:\s|$)',
+        # Pattern 7: "Order [quantity] [item name]"
+        r'\border\s+(\d+)\s+([a-zA-Z\s]+?)(?:\s|$)',
+        # Pattern 8: "Order [item name]"
+        r'\border\s+(?!\d+\s+)([a-zA-Z\s]+?)(?:\s|$)'
+    ]
+    
+    # Detect multi-category bulk orders FIRST (more specific patterns)
+    # Enhanced to catch phrases like "I want Quantity [category] with more 2 items"
+    multi_category_pattern = r'\b(?:i\s+want(?:\s+to\s+order)?|get\s+me|order|quantity)\s+(.+?)\s*$'
+    multi_match = re.search(multi_category_pattern, lower_message)
+    
+    if multi_match:
+        order_text = multi_match.group(1)
+        categories = []
+        
+        # Enhanced patterns for multi-category detection
+        # Added pattern to catch "Quantity [category] with more [number] items"
+        quantity_category_patterns = [
+            (r'(\d+)\s+(pizza|pizzas)', 'Pizza'),
+            (r'(\d+)\s+(pasta|pastas)', 'Pasta'),
+            (r'(\d+)\s+(salad|salads)', 'Salads'),
+            (r'(\d+)\s+(dessert|desserts)', 'Desserts'),
+            (r'(\d+)\s+(beverage|beverages|drink|drinks)', 'Beverages'),
+            (r'(\d+)\s+(appetizer|appetizers|starter|starters)', 'Appetizers'),
+            (r'(\d+)\s+(main\s+course|main\s+courses|entree|entrees)', 'Main Courses'),
+            (r'(\d+)\s+(seafood)', 'Seafood')
+        ]
+        
+        for pattern, category in quantity_category_patterns:
+            matches = re.findall(pattern, order_text)
+            for match in matches:
+                quantity = int(match[0])
+                categories.append({"category": category, "quantity": quantity})
+        
+        # Handle special pattern: "Quantity [category] with more [number] items"
+        special_pattern = r'(?:quantity\s+)?([a-zA-Z]+)\s+with\s+more\s+(\d+)'
+        special_matches = re.findall(special_pattern, order_text, re.IGNORECASE)
+        for match in special_matches:
+            category_name = match[0].lower()
+            quantity = int(match[1])
+            # Map common category names to proper category names
+            category_mapping = {
+                'pizza': 'Pizza', 'pizzas': 'Pizza',
+                'pasta': 'Pasta', 'pastas': 'Pasta',
+                'salad': 'Salads', 'salads': 'Salads',
+                'dessert': 'Desserts', 'desserts': 'Desserts',
+                'beverage': 'Beverages', 'beverages': 'Beverages', 'drink': 'Beverages', 'drinks': 'Beverages',
+                'appetizer': 'Appetizers', 'appetizers': 'Appetizers', 'starter': 'Appetizers', 'starters': 'Appetizers',
+                'main': 'Main Courses', 'main course': 'Main Courses', 'main courses': 'Main Courses', 'entree': 'Main Courses', 'entrees': 'Main Courses',
+                'seafood': 'Seafood'
+            }
+            mapped_category = category_mapping.get(category_name.lower(), category_name.capitalize())
+            categories.append({"category": mapped_category, "quantity": quantity})
+        
+        # If multiple categories detected, return multi-category action
+        if len(categories) > 1:
+            return {
+                "action": "multi_category_bulk",
+                "message_type": "text",
+                "multi_categories": categories,
+                "current_category_index": 0,
+                "response_delay": 1500
+            }
+        
+        # If single category with quantity 2+, return bulk menu
+        elif len(categories) == 1:
+            category_data = categories[0]
+            return {
+                "action": "bulk_menu",
+                "message_type": "text",
+                "category": category_data["category"],
+                "bulk_quantity": category_data["quantity"],
+                "response_delay": 1500
+            }
+    
+    # Check for multiple items in a single command (e.g., "Add 2 Margherita Pizza and 3 Tiramisu")
+    # Only check if not a remove/decrease command
+    if not any(word in lower_message for word in ['remove', 'delete', 'decrease', 'reduce', 'take out']):
+        # More specific pattern to avoid conflicts with multi-category orders
+        multiple_items_pattern = r'\b(?:add|i\s+want|get\s+me|order)\s+(\d+\s+[a-zA-Z\s]+?(?:\s+and\s+\d+\s+[a-zA-Z\s]+?)+)'
+        multiple_match = re.search(multiple_items_pattern, lower_message, re.IGNORECASE)
+        
+        if multiple_match:
+            full_order_text = multiple_match.group(1)
+            print(f"🔍 Multiple items detected in: '{full_order_text}'")
+            
+            # Detect emotional state for personalized processing
+            emotional_state = detect_emotional_state(user_message)
+            
+            # Split by 'and' to find multiple items
+            if ' and ' in full_order_text:
+                item_parts = [part.strip() for part in full_order_text.split(' and ')]
+                detected_items = []
+                not_found_items = []
+                
+                print(f"📋 Processing {len(item_parts)} item parts: {item_parts}")
+                
+                for part in item_parts:
+                    # Extract quantity and item name from each part
+                    item_match = re.search(r'^(?:(\d+)\s+)?(?:of\s+)?(.+)$', part.strip(), re.IGNORECASE)
+                    if item_match:
+                        quantity_str = item_match.group(1)
+                        item_name = item_match.group(2).strip()
+                        quantity = int(quantity_str) if quantity_str else 1
+                        
+                        print(f"🔎 Looking for item: '{item_name}' (quantity: {quantity})")
+                        
+                        # Use fuzzy matching to find the exact menu item with details
+                        item_details = find_menu_item_fuzzy_with_details(item_name)
+                        
+                        if item_details:
+                            print(f"✅ Found: '{item_name}' → '{item_details['name']}'")
+                            detected_items.append({
+                                "name": item_details['name'],
+                                "quantity": quantity,
+                                "price": item_details.get('price', 12.99),
+                                "id": item_details.get('id', f"item-{len(detected_items)+1}"),
+                                "human_comment": _make_human_comment_for_item(item_details)
+                            })
+                        else:
+                            print(f"❌ Not found: '{item_name}'")
+                            not_found_items.append(f"{quantity} {item_name}")
+                
+                print(f"📊 Results: {len(detected_items)} found, {len(not_found_items)} not found")
+                
+                # If we have items detected but also some not found, return partial success with message
+                if detected_items and not_found_items:
+                    return {
+                        "action": "add_multiple_partial",
+                        "message_type": "text",
+                        "items": detected_items,
+                        "not_found_items": not_found_items,
+                        "response_delay": 1000
+                    }
+                # If multiple items were detected, return multi-item add action
+                elif len(detected_items) > 1:
+                    return {
+                        "action": "add_multiple",
+                        "message_type": "text",
+                        "items": detected_items,
+                        "emotional_context": emotional_state,
+                        "response_delay": 1000
+                    }
+                # If only one item detected from the 'and' split, continue to single item processing
+                elif len(detected_items) == 1:
+                    return {
+                        "action": "add",
+                        "message_type": "text",
+                        "items": detected_items,
+                        "response_delay": 1000
+                    }
+                # If no items found, return error message
+                elif not_found_items:
+                    return {
+                        "action": "item_not_found",
+                        "message_type": "text",
+                        "not_found_items": not_found_items,
+                        "response_delay": 1000
+                    }
+    
+    # Single item detection (existing logic)
+    for pattern in direct_item_patterns:
         direct_item_match = re.search(pattern, lower_message, re.IGNORECASE)
         if direct_item_match:
-            print(f"🎯 Pattern {i} matched: {pattern}")
+            # Group 1: quantity (optional), Group 2: item name
+            quantity_str = direct_item_match.group(1)
+            item_name = direct_item_match.group(2).strip() if direct_item_match.group(2) else direct_item_match.group(1).strip()
+            quantity = int(quantity_str) if quantity_str and quantity_str.isdigit() else 1
             
-            groups = direct_item_match.groups()
-            print(f"📝 Groups found: {groups}")
+            print(f"🔎 Single item search: '{item_name}' (quantity: {quantity})")
             
-            # Determine quantity and item name based on number of groups
-            if len(groups) == 2:
-                # Two groups: either (quantity, item) or (item, None)
-                if groups[0] and groups[0].isdigit():
-                    quantity = int(groups[0])
-                    item_name = groups[1].strip() if groups[1] else ""
-                else:
-                    quantity = 1
-                    item_name = groups[0].strip() if groups[0] else ""
-            elif len(groups) == 1:
-                # One group: item name only
-                quantity = 1
-                item_name = groups[0].strip()
-            else:
-                continue
-            
-            # Skip if item name is empty or too short
-            if not item_name or len(item_name.strip()) < 2:
-                print(f"❌ Item name too short or empty: '{item_name}'")
-                continue
-            
-            # Skip common non-food words that might be matched
-            skip_words = ['me', 'it', 'that', 'this', 'some', 'any', 'help', 'please', 'thanks', 'thank you']
-            if item_name.lower().strip() in skip_words:
-                print(f"❌ Skipping common word: '{item_name}'")
-                continue
-            
-            print(f"🔍 Single item search: '{item_name}' (quantity: {quantity})")
-            
-            # Use enhanced fuzzy matching to find the exact menu item
+            # Use fuzzy matching to find the exact menu item with details
             item_details = find_menu_item_fuzzy_with_details(item_name)
             
             if item_details:
-                print(f"✅ Found: '{item_name}' -> '{item_details['name']}'")
+                print(f"✅ Found: '{item_name}' → '{item_details['name']}'")
+                # Detect emotional state for personalized item comments
+                emotional_state = detect_emotional_state(user_message)
                 return {
                     "action": "add",
-                    "message_type": "cart",
+                    "message_type": "text",
                     "items": [{
                         "name": item_details['name'],
                         "quantity": quantity,
                         "price": item_details.get('price', 12.99),
-                        "id": item_details.get('id', f"item-{quantity}")
+                        "id": item_details.get('id', f"item-{quantity}"),
+                        "human_comment": _make_human_comment_for_item(item_details, emotional_state)
                     }],
+                    "emotional_context": emotional_state,
                     "response_delay": 1000
                 }
             else:
@@ -544,61 +904,9 @@ def detect_intent_and_create_action(user_message, response_text):
                 return {
                     "action": "item_not_found",
                     "message_type": "text",
-                    "not_found_items": [f"{quantity} {item_name}" if quantity > 1 else item_name],
+                    "not_found_items": [f"{quantity} {item_name}"],
                     "response_delay": 1000
                 }
-    
-    # Continue with existing patterns for remove, increase, decrease, multi-category, etc.
-    # ... (rest of the function remains the same as in the original)
-    
-    # PRIORITY 3: Detect REMOVE commands (with quantities)
-    remove_patterns = [
-        r'\b(?:remove|delete|cancel|take\s+out)\s+(?:(\d+)\s+)?([a-zA-Z\s]+?)(?:\s|$)',
-        r'\b(?:remove|delete)\s+([a-zA-Z\s]+?)\s+by\s+(\d+)\b',
-        r'\btake\s+out\s+(?:(\d+)\s+)?([a-zA-Z\s]+?)(?:\s|$)'
-    ]
-    
-    for pattern in remove_patterns:
-        remove_match = re.search(pattern, lower_message, re.IGNORECASE)
-        if remove_match:
-            if len(remove_match.groups()) == 2 and remove_match.group(2):
-                if 'by' in pattern:
-                    item_name = remove_match.group(1).strip()
-                    quantity = int(remove_match.group(2))
-                else:
-                    quantity_str = remove_match.group(1)
-                    item_name = remove_match.group(2).strip()
-                    quantity = int(quantity_str) if quantity_str else 1
-            else:
-                item_name = remove_match.group(1).strip() if remove_match.group(1) else remove_match.group(2).strip()
-                quantity = 1
-            
-            print(f"🗑️ Remove detected: '{item_name}' (quantity: {quantity})")
-            
-            item_details = find_menu_item_fuzzy_with_details(item_name)
-            if item_details:
-                print(f"✅ Found item to remove: '{item_details['name']}'")
-                if quantity == 1:
-                    return {
-                        "action": "remove",
-                        "message_type": "cart",
-                        "items": [{"name": item_details['name']}],
-                        "response_delay": 1000
-                    }
-                else:
-                    return {
-                        "action": "update",
-                        "message_type": "cart",
-                        "operation": "decrease",
-                        "target_item": item_details['name'],
-                        "quantity": quantity,
-                        "response_delay": 1000
-                    }
-            else:
-                print(f"❌ Item not found for removal: '{item_name}'")
-    
-    # Continue with rest of existing logic...
-    # (I'll include the key parts but keep this focused on the main issue)
     
     # Default fallback
     return {"action": "none", "message_type": "text"}
@@ -609,6 +917,43 @@ def handle_rate_limit_fallback(user_message, cart_items):
     
     # Initialize default response
     response = "I'm currently experiencing high demand (rate limit reached), but I can still help you! What would you like to order?"
+    
+    # Check for greetings with emotional intelligence
+    if any(greeting in lower_message for greeting in ['hi', 'hello', 'hey']):
+        # Extract name if present
+        name_match = re.search(r'(?:hi|hello|hey)\s*,?\s*([a-zA-Z]+)', lower_message, re.IGNORECASE)
+        name = name_match.group(1).capitalize() if name_match else None
+        
+        # Detect emotional state
+        emotional_state = detect_emotional_state(user_message)
+        
+        # Generate empathetic response even in fallback mode
+        if emotional_state['emotion'] == 'crisis':
+            if name:
+                response = f"I'm deeply concerned about you, {name}. Please reach out for professional help if you're having thoughts of self-harm. Let me help you with some comfort food in the meantime."
+            else:
+                response = "I'm very concerned about you. Please consider reaching out to a mental health professional. Let me help you with some nourishing food right now."
+        elif emotional_state['emotion'] in ['very_negative', 'negative']:
+            if name:
+                response = f"I'm so sorry you're going through a difficult time, {name}. Even though I'm experiencing technical limits, I'm here for you. Let me help you find something comforting."
+            else:
+                response = "I'm really sorry you're having such a hard time. Even with my current limitations, I want to help you find something comforting to eat."
+        elif emotional_state['emotion'] == 'lonely':
+            if name:
+                response = f"You're not alone, {name}. I'm here with you, and I care about helping you get something wonderful to eat."
+            else:
+                response = "You're not alone right now. I'm here with you, and I want to help you find something delicious."
+        elif emotional_state['emotion'] in ['positive', 'celebratory']:
+            if name:
+                response = f"I love your positive energy, {name}! Let's find something amazing to match your great mood."
+            else:
+                response = "Your positive energy is wonderful! Let's find something delicious to celebrate with."
+        elif name:
+            # Personalized greeting with name
+            response = f"Hello, {name}! It's nice to meet you. I'm here to help you order some delicious food. How are you feeling today?"
+        else:
+            # Standard greeting
+            response = "Hello there! I'm your friendly food ordering assistant. How are you doing today? What delicious items can I help you find?"
     
     # Detect intent and create appropriate response
     action_data = detect_intent_and_create_action(user_message, "")
@@ -630,7 +975,7 @@ def handle_rate_limit_fallback(user_message, cart_items):
             name = item.get('name', 'item') if isinstance(item, dict) else str(item)
             response = f"Great! I've added {quantity} {name} to your cart. Let me show you the updated cart."
             # Ensure cart summary is shown after addition
-            action_data = {"action": "show_cart", "message_type": "cart", "response_delay": 1000}
+            action_data = {"action": "show_cart", "message_type": "text", "response_delay": 1000}
         else:
             response = "I'd be happy to add that item to your cart. Could you please specify the item name?"
     
@@ -647,7 +992,7 @@ def handle_rate_limit_fallback(user_message, cart_items):
             if item_names:
                 response = f"Excellent! I've added {' and '.join(item_names)} to your cart. Let me show you the updated cart."
                 # Ensure cart summary is shown after addition
-                action_data = {"action": "show_cart", "message_type": "cart", "response_delay": 1000}
+                action_data = {"action": "show_cart", "message_type": "text", "response_delay": 1000}
             else:
                 response = "I'd be happy to add those items to your cart. Could you please specify the item names?"
     elif action_data['action'] == 'add_multiple_partial':
@@ -665,7 +1010,7 @@ def handle_rate_limit_fallback(user_message, cart_items):
             response = f"I've added {' and '.join(item_names)} to your cart."
             if not_found_items:
                 response += f" However, I couldn't find {' and '.join(not_found_items)} on our menu."
-            action_data = {"action": "show_cart", "message_type": "cart", "response_delay": 1000}
+            action_data = {"action": "show_cart", "message_type": "text", "response_delay": 1000}
         else:
             response = "I'd be happy to add those items to your cart. Could you please specify the item names?"
     
@@ -707,7 +1052,7 @@ def handle_rate_limit_fallback(user_message, cart_items):
             order_total = sum(item.get('total', item.get('price', 0) * item.get('quantity', 1)) for item in cart_items)
             action_data = {
                 "action": "place_order",
-                "message_type": "receipt",
+                "message_type": "text",
                 "order_id": f"ORD-{int(time.time())}",
                 "order_total": order_total,
                 "response_delay": 1500
@@ -752,14 +1097,22 @@ def handle_rate_limit_fallback(user_message, cart_items):
             response = f"I'll decrease {target} by {quantity}. Let me update your cart."
         
         # Ensure cart summary is shown after update
-        action_data = {"action": "show_cart", "message_type": "cart", "response_delay": 1000}
+        action_data = {"action": "show_cart", "message_type": "text", "response_delay": 1000}
     
     elif 'menu' in lower_message or 'category' in lower_message:
         response = "I'd love to show you our delicious menu! Let me display all our categories for you."
-        action_data = {"action": "show_menu", "message_type": "menu", "response_delay": 1000}
+        action_data = {"action": "show_menu", "message_type": "text", "response_delay": 1000}
     
     else:
-        response = "I'm currently experiencing high demand (rate limit reached), but I can still help you! What would you like to order?"
+        # Check for emotional context in any message
+        negative_emotions = ['worst', 'bad', 'terrible', 'awful', 'sad', 'depressed', 'upset', 'angry', 'horrible', 'miserable']
+        has_negative_emotion = any(emotion in lower_message for emotion in negative_emotions)
+        
+        if has_negative_emotion:
+            # Show empathy for negative emotions in any context
+            response = "I'm sorry to hear you're going through a tough time. Sometimes a delicious meal can help brighten the day. Would you like to hear about our menu options?"
+        else:
+            response = "I'm currently experiencing high demand (rate limit reached), but I can still help you! What would you like to order?"
     
     return jsonify({
         'response': response,
@@ -789,7 +1142,13 @@ def get_system_prompt():
         "- Handle unavailable items with alternatives\n"
         "- Support bulk quantity orders\n"
         "- Clear cart or chat history\n"
-        "- Process order placement and generate receipt\n\n"
+        "- Process order placement and generate receipt\n"
+        "- Advanced emotional intelligence and empathy\n"
+        "- Personalized responses based on emotional state\n"
+        "- Crisis detection and supportive responses\n"
+        "- Comfort food recommendations for different moods\n"
+        "- Celebration enhancement for positive moments\n"
+        "- Companion-like presence for lonely customers\n\n"
         "Key rules:\n"
         "- ALWAYS provide JSON actions for UI rendering\n"
         "- Keep text responses SHORT and let UI components show details\n"
@@ -800,7 +1159,24 @@ def get_system_prompt():
         "- For single category with quantity 2+, use 'bulk_menu' action\n"
         "- Support 'remove all [item type]' commands\n"
         "- Support 'clear chat' commands to reset chat history\n"
-        "- After order placement, clear chat and send thank you message\n\n"
+        "- After order placement, clear chat and send thank you message\n"
+        "- PRIORITIZE emotional intelligence and empathy in ALL responses\n"
+        "- Detect emotional state and adapt tone accordingly\n"
+        "- Use names when provided and maintain emotional context\n"
+        "- Show genuine care and concern for user wellbeing\n"
+        "- Offer comfort food suggestions based on emotional state\n"
+        "- Be a supportive companion, not just an order taker\n\n"
+        "Advanced Emotional Intelligence Guidelines:\n"
+        "- Detect wide range of emotions: crisis/suicidal thoughts, severe depression, sadness, anger, loneliness, illness, celebrations, happiness\n"
+        "- Crisis Detection: If user expresses suicidal thoughts or severe crisis, show deep concern and suggest professional help while offering comfort\n"
+        "- Empathy Matching: Match your empathy level to the intensity of user's emotions\n"
+        "- Personalization: Use names when provided and remember emotional context throughout conversation\n"
+        "- Comfort Food Therapy: Suggest specific comfort foods based on emotional state (warm soups for sadness, celebration dishes for happiness)\n"
+        "- Validation: Always validate user's feelings before offering solutions\n"
+        "- Presence: Make users feel heard and less alone, especially those expressing loneliness\n"
+        "- Supportive Language: Use phrases like 'I'm here for you', 'You matter', 'I care about your experience'\n"
+        "- Recovery Support: For negative emotions, offer hope and encouragement while respecting their current state\n"
+        "- Celebration Enhancement: Amplify joy for users sharing positive news or celebrations\n\n"
         "Category mapping:\n"
         "- 'pizza' → 'Pizza', 'pasta' → 'Pasta', 'salad' → 'Salads'\n"
         "- 'seafood', 'fish', 'salmon', 'shrimp' → 'Seafood'\n"
@@ -815,7 +1191,7 @@ def get_system_prompt():
         "  \"action\": \"add|remove|remove_all|update|show_menu|show_cart|place_order|bulk_menu|multi_category_bulk\",\n"
         "  \"items\": [{\"name\": \"item_name\", \"quantity\": number}],\n"
         "  \"target_item\": \"item_name\",\n"
-        "  \"message_type\": \"text|menu|category|cart|bulk-menu|receipt|multi-bulk\",\n"
+        "  \"message_type\": \"text\",\n"
         "  \"category\": \"category_name\",\n"
         "  \"bulk_quantity\": number,\n"
         "  \"multi_categories\": [{\"category\": \"name\", \"quantity\": number}],\n"
@@ -836,28 +1212,86 @@ def chat():
                 'action_data': {"action": "none", "message_type": "text"},
                 'success': False
             }), 400
-            
+
         user_message = data.get('message', '')
         session_id = data.get('session_id', 'default')
         cart_items = data.get('cart_items', [])
-        
-        # Refresh menu data periodically
+        user_mood = data.get('user_mood', None)
+        empathy_level = data.get('empathy_level', 'standard')
+
+        # Refresh menu data
         update_menu_items_from_graphql()
-        
+
+        # --- EARLY deterministic intent detection / local parsing (avoid LLM when possible) ---
+        # 1) try quick structured parse for explicit items (local rules)
+        local_items = extract_items_from_text(user_message)
+        if local_items:
+            # return structured add_multiple or add
+            items_out = []
+            for it in local_items:
+                # try to resolve to menu details (best effort)
+                details = find_menu_item_fuzzy_with_details(it['name']) or {'name': it['name'], 'price': 0.0}
+                items_out.append({
+                    'name': details.get('name', it['name']),
+                    'quantity': int(it.get('quantity', 1)),
+                    'price': details.get('price', 0.0),
+                    'id': details.get('id', f"item-{int(time.time())}"),
+                    'human_comment': _make_human_comment_for_item(details)
+                })
+
+            action = 'add_multiple' if len(items_out) > 1 else 'add'
+            # Build a safe human-friendly summary string (avoid nested/nested f-strings)
+            if action == 'add_multiple':
+                item_strs = ', '.join(f"{i['quantity']} {i['name']}" for i in items_out)
+                resp_text = f"Great - adding {item_strs} to your cart."
+            else:
+                resp_text = f"Great - adding {items_out[0]['quantity']} {items_out[0]['name']} to your cart."
+
+            return jsonify({
+                'response': resp_text,
+                'action_data': {
+                    'action': action,
+                    'items': items_out,
+                    'message_type': 'text',
+                    'response_delay': 800
+                },
+                'success': True
+            })
+
+        # 2) run deterministic intent detector for other UI actions
+        early_action = detect_intent_and_create_action(user_message, "")
+        if early_action and early_action.get('action') and early_action.get('action') != 'none':
+            # If it's a greeting, return a short personalized response immediately (avoid LLM)
+            if early_action.get('action') == 'greeting':
+                return jsonify({
+                    'response': early_action.get('response_text', 'Hello!'),
+                    'action_data': { **early_action, 'message_type': 'text' },
+                    'success': True
+                })
+            # return early if detected (avoid LLM) for other deterministic actions
+            return jsonify({
+                'response': '',  # frontend will use action_data to render short messages
+                'action_data': { **early_action, 'message_type': 'text' },
+                'success': True
+            })
+
+        # --- end early detection ---
+
         # Initialize or get conversation history
         if session_id not in conversations:
             conversations[session_id] = [SystemMessage(content=get_system_prompt())]
-        
+
         messages = conversations[session_id]
-        
-        # Add cart context to the message
+
+        # Add cart & mood context and user message
         cart_context = f"\nCurrent cart: {json.dumps(cart_items)}" if cart_items else "\nCart is empty."
-        full_message = user_message + cart_context
-        
-        # Add user message to conversation
+        mood_context = f"\nUser mood: {json.dumps(user_mood)}" if user_mood else ""
+        empathy_context = f"\nEmpathy level: {empathy_level}" if empathy_level != 'standard' else ""
+        full_message = user_message + cart_context + mood_context + empathy_context
+
         messages.append(HumanMessage(content=full_message))
-        
-        # Check if AI service is available
+
+        # Check LLM availability
         if llm is None:
             return jsonify({
                 'response': "AI service is not available. Please check the OpenAI API key configuration.",
@@ -865,61 +1299,104 @@ def chat():
                 'success': False,
                 'error': "OpenAI client not initialized"
             }), 503
-        
+
         # Get AI response
         try:
             response = llm.invoke(messages)
             text = str(response.content).strip() if hasattr(response, 'content') else ""
         except Exception as e:
+            # existing error handling (rate limit fallback etc.)
             error_message = str(e)
             print(f"OpenAI API Error: {error_message}")
-            
-            # Check if it's a rate limit error
             if "rate_limit_exceeded" in error_message or "429" in error_message or "Rate limit reached" in error_message:
-                # Use fallback response for rate limit
-                print("Rate limit detected, using fallback response")
-                return handle_rate_limit_fallback(user_message, cart_items)
-            elif "invalid_api_key" in error_message or "401" in error_message:
-                # Invalid API key, use fallback
-                print("Invalid API key detected, using fallback response")
                 return handle_rate_limit_fallback(user_message, cart_items)
             else:
-                # Other API errors, also use fallback to maintain functionality
-                print(f"Other API error detected, using fallback response: {error_message}")
                 return handle_rate_limit_fallback(user_message, cart_items)
-        
-        # Clean natural language response (remove JSON and clean formatting)
-        natural_response = re.sub(r"```json.*```", "", text, flags=re.DOTALL).strip()
-        
-        # Extract JSON from response
-        json_match = re.search(r"```json\s*(\{.*\})\s*```", text, re.DOTALL)
-        if json_match:
-            try:
-                action_data = json.loads(json_match.group(1))
-            except json.JSONDecodeError:
-                action_data = {"action": "none", "message_type": "text"}
+
+        # Extract JSON from LLM text robustly (fenced or inline) and remove from visible response
+        extracted_json, cleaned_text = extract_json_from_text(text)
+        action_data = None
+        if extracted_json:
+            action_data = extracted_json
+            action_data['message_type'] = 'text'
+            natural_response = clean_response_formatting(cleaned_text)
         else:
-            # If no JSON found, try to detect intent and create appropriate action
-            action_data = detect_intent_and_create_action(user_message, natural_response)
-        
-        # Clean up formatting issues
-        natural_response = clean_response_formatting(natural_response)
-        
-        # Add assistant response to conversation history
+            # try to parse JSON in the natural response via detect_intent fallback
+            natural_response = clean_response_formatting(re.sub(r"```json.*```", "", text, flags=re.DOTALL).strip())
+            # try to extract JSON using previous regex as fallback
+            json_block = re.search(r"```json\s*(\{.*\})\s*```", text, re.DOTALL)
+            if json_block:
+                try:
+                    action_data = json.loads(json_block.group(1))
+                    action_data['message_type'] = 'text'
+                except Exception:
+                    action_data = detect_intent_and_create_action(user_message, natural_response)
+            else:
+                # last resort: attempt to detect intent from message
+                action_data = detect_intent_and_create_action(user_message, natural_response)
+            if action_data and 'message_type' not in action_data:
+                action_data['message_type'] = 'text'
+
+        # Add assistant response to conversation history (without JSON)
         messages.append(AIMessage(content=natural_response))
-        
-        # Limit conversation history to last 20 messages
-        if len(messages) > 21:  # Keep system message + 20 recent messages
+
+        # Trim history
+        if len(messages) > 21:
             messages = [messages[0]] + messages[-20:]
-        
         conversations[session_id] = messages
-        
-        return jsonify({
+
+        response_data = {
             'response': natural_response,
-            'action_data': action_data,
+            'action_data': action_data or {"action": "none", "message_type": "text"},
             'success': True
-        })
-        
+        }
+
+        # If action is UI-driven menu display, keep textual response short (prevent listing menu items in chat)
+        if action_data and isinstance(action_data, dict) and action_data.get('action') == 'show_menu':
+            response_data['response'] = 'Opening the menu for you.'
+            # ensure message_type present
+            response_data['action_data']['message_type'] = response_data['action_data'].get('message_type', 'text')
+
+        # Enhanced emotional processing and follow-up responses
+        emotional_state = detect_emotional_state(user_message)
+        if emotional_state['emotion'] != 'neutral':
+            response_data['emotional_state'] = emotional_state
+            
+            # Generate appropriate follow-up based on emotional intensity
+            if emotional_state['emotion'] == 'crisis':
+                response_data['follow_up'] = {
+                    "message": "Please know that I genuinely care about your wellbeing. If you're having thoughts of self-harm, please reach out to a mental health crisis line. You are valuable and your life matters. Now, let me help you with some nourishing food.",
+                    "response_delay": 1500,
+                    "priority": "urgent"
+                }
+            elif emotional_state['intensity'] in ['very_high', 'high']:
+                follow_up_messages = [
+                    "I want you to know that your feelings are valid, and you're not alone in this. I'm here to help in whatever small way I can.",
+                    "Sometimes when we're going through tough times, taking care of our basic needs like eating well can be a form of self-care. Let me help with that.",
+                    "You've reached out today, and that shows strength. Let me make sure you get something nourishing and comforting."
+                ]
+                response_data['follow_up'] = {
+                    "message": random.choice(follow_up_messages),
+                    "response_delay": 1200
+                }
+            elif emotional_state['emotion'] == 'lonely':
+                response_data['follow_up'] = {
+                    "message": "You're not alone right now - I'm here with you, and I genuinely enjoy our conversation. Let's find you something wonderful to eat.",
+                    "response_delay": 1000
+                }
+            elif emotional_state['emotion'] == 'positive' or emotional_state['emotion'] == 'celebratory':
+                response_data['follow_up'] = {
+                    "message": "Your positive energy makes my day brighter too! Let's find something amazing to match your great mood.",
+                    "response_delay": 800
+                }
+            elif emotional_state['emotion'] == 'unwell':
+                response_data['follow_up'] = {
+                    "message": "I hope you feel better soon. When we're not feeling well, it's especially important to nourish ourselves. Let me help you find something gentle and healing.",
+                    "response_delay": 1000
+                }
+
+        return jsonify(response_data)
+
     except Exception as e:
         return jsonify({
             'response': "I'm sorry, I encountered an error. Please try again.",
@@ -1019,7 +1496,142 @@ def refresh_menu_data():
             'error': str(e)
         }), 500
 
+def _normalize_text(s):
+    if not s:
+        return ''
+    s = s.lower()
+    s = s.replace('&', 'and')
+    s = re.sub(r"[’‘'\"`]", '', s)
+    s = re.sub(r'[^a-z0-9\s]', ' ', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+def _singularize_token(t):
+    if not t:
+        return t
+    # basic plural -> singular heuristics
+    if t.endswith('ies') and len(t) > 3:
+        return t[:-3] + 'y'
+    if t.endswith('es') and len(t) > 2:
+        return t[:-2]
+    if t.endswith('s') and len(t) > 2:
+        return t[:-1]
+    return t
+
+def extract_items_from_text(text):
+    """
+    Return list of {'name': str, 'quantity': int} for items parsed from text.
+    Handles:
+      - "2 Fish and Chips and 1 Grilled Salmon"
+      - "I want Fish and Chips"
+      - "Add 3 burgers"
+    Avoids splitting 'Fish and Chips' when it is a single menu item by returning the whole phrase first.
+    
+    IMPORTANT: Ignores remove/delete/decrease commands to prevent false positives.
+    """
+    if not text:
+        return []
+
+    # First check if this is a remove/delete/decrease command - if so, return empty to let remove patterns handle it
+    lower_text = text.lower()
+    remove_indicators = ['remove', 'delete', 'cancel', 'take out', 'decrease', 'reduce']
+    if any(indicator in lower_text for indicator in remove_indicators):
+        return []
+
+    items = []
+
+    # 1) explicit quantity patterns like "2 Fish and Chips"
+    for m in re.finditer(r'(\d+)\s+([A-ZaZ0-9&\'\-\s]+?)(?=(?:\s+(?:and|,|&)\s+\d|\s*$|[.,!?]))', text, re.I):
+        qty = int(m.group(1))
+        name = m.group(2).strip().rstrip('.,!?')
+        items.append({'name': name, 'quantity': qty})
+
+    if items:
+        return items
+
+    # 2) "I want X and Y" -> multiple without numbers. But first check if whole phrase is a single item.
+    m = re.search(r'(?:i want|i\'d like|i would like|order|add|i want to order)\s+(.+)$', text, re.I)
+    if m:
+        raw = m.group(1).strip().rstrip('.,!?')
+        norm_raw = _normalize_text(raw)
+        # if the raw phrase looks like "2 grilled salmon" capture leading number
+        leading_num = re.match(r'^(\d+)\s+(.+)$', raw)
+        if leading_num:
+            return [{'name': leading_num.group(2).strip(), 'quantity': int(leading_num.group(1))}]
+
+        # If backend has access to menu list it could check here; otherwise return split parts as items
+        # Try to split into parts but avoid splitting common "X and Y" that might be single item by returning joined phrase first
+        parts = re.split(r'\s+(?:and|&|,)\s+', raw, flags=re.I)
+        if len(parts) == 1:
+            # single item (no explicit separator)
+            # check for leading number inside single part
+            m2 = re.match(r'^(?:\b(\d+)\b\s*)?(.+)$', raw)
+            if m2:
+                qty = int(m2.group(1)) if m2.group(1) else 1
+                name = m2.group(2).strip()
+                return [{'name': name, 'quantity': qty}]
+        else:
+            for p in parts:
+                pm = re.match(r'^(?:\b(\d+)\b\s*)?(.+)$', p.strip())
+                if pm:
+                    qty = int(pm.group(1)) if pm.group(1) else 1
+                    name = pm.group(2).strip().rstrip('.,!?')
+                    items.append({'name': name, 'quantity': qty})
+            if items:
+                return items
+
+    # 3) last fallback: look for "add X" pattern
+    m = re.search(r'\badd\s+(?:\b(\d+)\b\s*)?(.+?)(?:[.?!]|$)', text, re.I)
+    if m:
+        qty = int(m.group(1)) if m.group(1) else 1
+        name = m.group(2).strip().rstrip('.,!?')
+        return [{'name': name, 'quantity': qty}]
+
+    return []
+
+def extract_json_from_text(text: str):
+    """Return (json_obj or None, cleaned_text_without_json)
+    - Finds fenced ```json { ... } ``` blocks first.
+    - Falls back to extracting the first balanced {...} object found anywhere.
+    """
+    if not text:
+        return None, text
+
+    # 1) fenced ```json ... ``` block
+    m = re.search(r"```json\s*(\{[\s\S]*\})\s*```", text, flags=re.IGNORECASE)
+    if m:
+        try:
+            obj = json.loads(m.group(1))
+            cleaned = text[:m.start()] + text[m.end():]
+            return obj, cleaned.strip()
+        except Exception:
+            pass
+
+    # 2) inline JSON object: find first '{' and capture balanced braces
+    start = text.find('{')
+    if start != -1:
+        stack = []
+        for i in range(start, len(text)):
+            ch = text[i]
+            if ch == '{':
+                stack.append('{')
+            elif ch == '}':
+                if stack:
+                    stack.pop()
+                    if not stack:
+                        candidate = text[start:i+1]
+                        try:
+                            obj = json.loads(candidate)
+                            cleaned = text[:start] + text[i+1:]
+                            return obj, cleaned.strip()
+                        except Exception:
+                            break
+        # No valid JSON parsed; continue below
+
+    # 3) nothing found
+    return None, text
+
 if __name__ == '__main__':
-    print("🤖 Starting Restaurant Chatbot Service...")
+    print("[CHATBOT] Starting Restaurant Chatbot Service...")
     print("📡 Service will be available at http://localhost:5000")
     app.run(host='0.0.0.0', port=5000, debug=True)
