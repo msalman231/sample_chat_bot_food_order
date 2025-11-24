@@ -1263,8 +1263,15 @@ def chat():
                 'success': True
             })
         
+        
         # 1b) try extract remove/decrease/increase items
-        remove_items = extract_remove_items_from_text(user_message)
+        # BUT: Skip this if "remove all" is detected (let detect_intent_and_create_action handle it)
+        has_remove_all = bool(re.search(r'\b(?:remove|delete|cancel|take\s+out)\s+all\s+', user_message.lower()))
+        if has_remove_all:
+            print(f"🔍 Detected 'remove all' pattern - skipping extract_remove_items_from_text")
+            remove_items = []
+        else:
+            remove_items = extract_remove_items_from_text(user_message)
         if remove_items:
             print(f"🔍 Extracted remove items: {remove_items}")
             items_out = []
@@ -1338,9 +1345,30 @@ def chat():
                     'action_data': { **early_action, 'message_type': 'text' },
                     'success': True
                 })
+            
+            # Generate appropriate response text for other actions
+            response_text = ''
+            action_type = early_action.get('action')
+            
+            if action_type == 'remove_all':
+                target_item = early_action.get('target_item', 'items')
+                response_text = f"Sure - removing all {target_item} from your cart."
+            elif action_type == 'show_cart':
+                response_text = "Here's what's in your cart."
+            elif action_type == 'clear_cart':
+                response_text = "Clearing your cart now."
+            elif action_type == 'place_order':
+                response_text = "Let me prepare your order."
+            elif action_type == 'show_menu':
+                category = early_action.get('category')
+                if category:
+                    response_text = f"Here's the {category} menu."
+                else:
+                    response_text = "Here's our menu."
+            
             # return early if detected (avoid LLM) for other deterministic actions
             return jsonify({
-                'response': '',  # frontend will use action_data to render short messages
+                'response': response_text,
                 'action_data': { **early_action, 'message_type': 'text' },
                 'success': True
             })
