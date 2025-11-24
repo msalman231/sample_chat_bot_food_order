@@ -201,25 +201,41 @@ try:
     base_url = os.getenv("OPENAI_BASE_URL")
     api_key = os.getenv("GITHUB_TOKEN") or os.getenv("OPENAI_API_KEY")
     
-    # Only initialize llm if we have an API key
-    if api_key and api_key != "your-openai-api-key-here":
-        # Note: There are type checking issues with SecretStr, but the functionality works
-        # For GitHub Models, use the model name without the "openai/" prefix
-        model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        if model_name.startswith("openai/"):
-            model_name = model_name.replace("openai/", "")
-        
-        llm = ChatOpenAI(
-            model=model_name,
-            temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.2")),
-            base_url=base_url,
-            api_key=api_key  # Type checking issue here, but functionality works
-        )
+    # Check if we should use fallback mode
+    use_fallback = (
+        api_key == "fallback_mode" or 
+        api_key == "your-openai-api-key-here" or 
+        not api_key or
+        api_key.strip() == ""
+    )
+    
+    # Only initialize llm if we have a valid API key AND not forcing fallback
+    if not use_fallback:
+        try:
+            # Note: There are type checking issues with SecretStr, but the functionality works
+            # For GitHub Models, use the model name without the "openai/" prefix
+            model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+            if model_name.startswith("openai/"):
+                model_name = model_name.replace("openai/", "")
+            
+            print(f"[INIT] Attempting to initialize AI model: {model_name}")
+            llm = ChatOpenAI(
+                model=model_name,
+                temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.2")),
+                base_url=base_url,
+                api_key=api_key,  # Type checking issue here, but functionality works
+                request_timeout=15.0  # Add 15 second timeout to prevent hanging
+            )
+            print("[INIT] ✅ AI model initialized successfully")
+        except Exception as init_error:
+            print(f"[INIT] ⚠️ Error initializing AI model: {init_error}")
+            print("[INIT] Falling back to rule-based responses")
+            llm = None
     else:
         llm = None
-        print("OpenAI API key not provided, running in fallback mode")
+        print("[INIT] Running in FALLBACK MODE (rule-based responses, no AI API)")
 except Exception as e:
-    print(f"Error initializing OpenAI client: {e}")
+    print(f"[INIT] Error during initialization: {e}")
     llm = None
 
 # Store conversation sessions
@@ -464,6 +480,8 @@ def generate_empathetic_response(emotional_state, user_name=None, context='greet
 def detect_intent_and_create_action(user_message, response_text):
     """Detect user intent and create appropriate action when JSON parsing fails"""
     lower_message = user_message.lower()
+    # Strip punctuation to improve regex matching
+    lower_message = re.sub(r'[.,!?]', '', lower_message).strip()
     
     print(f"🔍 Analyzing message: '{user_message}'")
     
@@ -508,16 +526,16 @@ def detect_intent_and_create_action(user_message, response_text):
     # PRIORITY 1: Detect REMOVE ALL commands first (before other patterns)
     # Enhanced remove all patterns with better specificity
     remove_all_patterns = [
-        # "Remove all [item]" or "Remove all [item] from cart"
-        r'\b(?:remove|delete|cancel|take\s+out)\s+all\s+([a-zA-Z\s]+?)(?:\s+from\s+cart)?(?:\s|$)',
-        # "Remove all of [item]" or "Remove all of [item] from cart"
-        r'\b(?:remove|delete|cancel|take\s+out)\s+all\s+of\s+([a-zA-Z\s]+?)(?:\s+from\s+cart)?(?:\s|$)'
+        # "Remove all [item]" or "Remove all [item] from cart" (with optional "of" and "the")
+        r'\b(?:remove|delete|cancel|take\s+out)\s+all\s+(?:of\s+)?(?:the\s+)?([a-zA-Z0-9\s]+)(?:\s+from\s+cart)?(?:\s|$)',
     ]
     
     for pattern in remove_all_patterns:
         remove_all_match = re.search(pattern, lower_message, re.IGNORECASE)
         if remove_all_match:
             item_name = remove_all_match.group(1).strip()
+            # Clean up common polite words from the end of the item name
+            item_name = re.sub(r'\b(?:please|plz|now|thanks|thank\s+you|right\s+now)\b', '', item_name, flags=re.IGNORECASE).strip()
             print(f"🗑️ Remove ALL detected: '{item_name}'")
             
             # Find the exact menu item
@@ -540,6 +558,8 @@ def detect_intent_and_create_action(user_message, response_text):
         r'\b(?:remove|delete)\s+(?:the\s+)?(\d+)\s+quantity\s+of\s+([a-zA-Z\s]+?)(?:\s|$)',
         # "Remove [item] by [quantity]"
         r'\b(?:remove|delete)\s+([a-zA-Z\s]+?)\s+by\s+(\d+)\b',
+        # "Remove the [quantity] [item]" (New pattern for "remove the 2 pizzas")
+        r'\b(?:remove|delete|cancel)\s+the\s+(\d+)\s+(.+?)(?:\s+from\s+cart)?(?:\s|$)',
         # "Remove [quantity] [item]" (but not if it's "quantity of") - GREEDY match for full item names
         r'\b(?:remove|delete|cancel|take\s+out)\s+(\d+)\s+(?!quantity\s+of)(.+?)(?:\s*$)',
         # "Remove the [item]" (with "the" prefix, no quantity)
@@ -564,6 +584,10 @@ def detect_intent_and_create_action(user_message, response_text):
                 # Pattern: "remove [item] by [quantity]"
                 item_name = remove_match.group(1).strip()
                 quantity = int(remove_match.group(2))
+            elif 'the\\s+(\\d+)\\s+(.+?)' in pattern:
+                # Pattern: "remove the [quantity] [item]"
+                quantity = int(remove_match.group(1))
+                item_name = remove_match.group(2).strip()
             elif '(\\d+)\\s+(?!quantity\\s+of)(.+?)' in pattern:
                 # Pattern: "remove [quantity] [item]" (new greedy pattern)
                 quantity = int(remove_match.group(1))
@@ -1043,6 +1067,12 @@ def handle_rate_limit_fallback(user_message, cart_items):
         # Handle clear chat in fallback mode
         response = "Chat cleared! How can I help you today?"
         action_data = {"action": "clear_chat", "message_type": "text", "response_delay": 500}
+        try:
+            session_id = request.get_json().get('session_id') if request.get_json() else None
+        except Exception:
+            session_id = None
+        session_key = session_id if session_id else 'default'
+        conversations[session_key] = [SystemMessage(content=get_system_prompt())]
     
     elif action_data['action'] == 'place_order':
         if not cart_items:
@@ -1073,31 +1103,6 @@ def handle_rate_limit_fallback(user_message, cart_items):
                 response = "Perfect! I'll help you order from multiple categories. Let's start!"
         else:
             response = "I'll help you with your multi-category order. Let me show you the menu options."
-    
-    elif action_data['action'] == 'clear_chat':
-        response = "Chat cleared! How can I help you today?"
-        # Clear the conversation for this session
-        # Get session_id from request data if available
-        try:
-            session_id = request.get_json().get('session_id') if request.get_json() else None
-        except:
-            session_id = None
-        
-        session_key = session_id if session_id else 'default'
-        conversations[session_key] = [SystemMessage(content=get_system_prompt())]
-    
-    elif action_data['action'] == 'update':
-        operation = action_data.get('operation', 'update')
-        target = action_data.get('target', 'item')
-        quantity = action_data.get('quantity', 1)
-        
-        if operation == 'increase':
-            response = f"I'll increase {target} by {quantity}. Let me update your cart."
-        else:
-            response = f"I'll decrease {target} by {quantity}. Let me update your cart."
-        
-        # Ensure cart summary is shown after update
-        action_data = {"action": "show_cart", "message_type": "text", "response_delay": 1000}
     
     elif 'menu' in lower_message or 'category' in lower_message:
         response = "I'd love to show you our delicious menu! Let me display all our categories for you."
@@ -1257,6 +1262,71 @@ def chat():
                 },
                 'success': True
             })
+        
+        # 1b) try extract remove/decrease/increase items
+        remove_items = extract_remove_items_from_text(user_message)
+        if remove_items:
+            print(f"🔍 Extracted remove items: {remove_items}")
+            items_out = []
+            operation = remove_items[0]['operation']  # All items will have same operation
+            
+            for it in remove_items:
+                # try to resolve to menu details (best effort)
+                details = find_menu_item_fuzzy_with_details(it['name']) or {'name': it['name'], 'price': 0.0}
+                print(f"🔍 Resolved '{it['name']}' to menu item: {details.get('name', 'NOT FOUND')}")
+                items_out.append({
+                    'name': details.get('name', it['name']),
+                    'quantity': int(it.get('quantity', 1)),
+                    'price': details.get('price', 0.0),
+                    'id': details.get('id', f"item-{int(time.time())}")
+                })
+            
+            # Determine action based on operation
+            if operation == 'remove':
+                action = 'remove'
+                verb = 'removing'
+            elif operation == 'decrease' or operation == 'increase':
+                action = 'update'
+                verb = 'decreasing' if operation == 'decrease' else 'increasing'
+            else:
+                action = 'remove'
+                verb = 'removing'
+            
+            # Build response text
+            if len(items_out) > 1:
+                item_strs = ', '.join(f"{i['quantity']} {i['name']}" for i in items_out)
+                resp_text = f"Sure - {verb} {item_strs}."
+            else:
+                resp_text = f"Sure - {verb} {items_out[0]['quantity']} {items_out[0]['name']}."
+            
+            # Build action data based on action type
+            if action == 'update':
+                # For update action, frontend expects: operation, target_item, quantity
+                # Process each item separately if multiple
+                first_item = items_out[0]
+                action_data = {
+                    'action': action,
+                    'operation': operation,
+                    'target_item': first_item['name'],
+                    'quantity': first_item['quantity'],
+                    'message_type': 'text',
+                    'response_delay': 800
+                }
+            else:
+                # For remove action, frontend expects: items array
+                action_data = {
+                    'action': action,
+                    'items': items_out,
+                    'message_type': 'text',
+                    'response_delay': 800
+                }
+            
+            print(f"📤 Returning remove action: {action}, items: {items_out}")
+            return jsonify({
+                'response': resp_text,
+                'action_data': action_data,
+                'success': True
+            })
 
         # 2) run deterministic intent detector for other UI actions
         early_action = detect_intent_and_create_action(user_message, "")
@@ -1302,15 +1372,24 @@ def chat():
 
         # Get AI response
         try:
+            print(f"[AI] Invoking LLM for session {session_id}...")
             response = llm.invoke(messages)
             text = str(response.content).strip() if hasattr(response, 'content') else ""
+            print(f"[AI] Response received successfully")
         except Exception as e:
             # existing error handling (rate limit fallback etc.)
             error_message = str(e)
-            print(f"OpenAI API Error: {error_message}")
-            if "rate_limit_exceeded" in error_message or "429" in error_message or "Rate limit reached" in error_message:
+            print(f"\u274c OpenAI API Error: {error_message}")
+            
+            # Check for timeout errors
+            if "timeout" in error_message.lower() or "timed out" in error_message.lower():
+                print("\u26a0\ufe0f Request timeout - using fallback")
+                return handle_rate_limit_fallback(user_message, cart_items)
+            elif "rate_limit_exceeded" in error_message or "429" in error_message or "Rate limit reached" in error_message:
+                print("\u26a0\ufe0f Rate limit - using fallback")
                 return handle_rate_limit_fallback(user_message, cart_items)
             else:
+                print("\u26a0\ufe0f API error - using fallback")
                 return handle_rate_limit_fallback(user_message, cart_items)
 
         # Extract JSON from LLM text robustly (fenced or inline) and remove from visible response
@@ -1345,21 +1424,31 @@ def chat():
             messages = [messages[0]] + messages[-20:]
         conversations[session_id] = messages
 
+        emotional_state = detect_emotional_state(user_message)
+
         response_data = {
             'response': natural_response,
             'action_data': action_data or {"action": "none", "message_type": "text"},
             'success': True
         }
 
-        # If action is UI-driven menu display, keep textual response short (prevent listing menu items in chat)
+        # Respect empathy: when the action is UI 'show_menu' but user emotion is non-neutral,
+        # keep or inject an empathetic response instead of a generic menu opener.
         if action_data and isinstance(action_data, dict) and action_data.get('action') == 'show_menu':
-            response_data['response'] = 'Opening the menu for you.'
+            if emotional_state and emotional_state.get('emotion', 'neutral') != 'neutral':
+                if not natural_response:
+                    # Inject a short empathetic line when the model returned empty text
+                    response_data['response'] = generate_empathetic_response(emotional_state, None, 'followup')
+                else:
+                    # Preserve the LLM-provided text (likely empathetic)
+                    response_data['response'] = natural_response
+            else:
+                response_data['response'] = natural_response or 'Opening the menu for you.'
             # ensure message_type present
             response_data['action_data']['message_type'] = response_data['action_data'].get('message_type', 'text')
 
-        # Enhanced emotional processing and follow-up responses
-        emotional_state = detect_emotional_state(user_message)
-        if emotional_state['emotion'] != 'neutral':
+        # Attach emotional state for frontend usage
+        if emotional_state and emotional_state.get('emotion') != 'neutral':
             response_data['emotional_state'] = emotional_state
             
             # Generate appropriate follow-up based on emotional intensity
@@ -1518,6 +1607,112 @@ def _singularize_token(t):
         return t[:-1]
     return t
 
+def extract_remove_items_from_text(text):
+    """
+    Extract items for remove/decrease/increase operations from text.
+    Handles patterns like:
+    - "remove two margherita pizza"
+    - "decrease burger by three"
+    - "increase salad"
+    - "delete one drink"
+    
+    Returns a list of items with their quantities and operation type
+    """
+    if not text:
+        return []
+    
+    # Word to number conversion map
+    word_to_number = {
+        'one': '1', 'two': '2', 'three': '3', 'four': '4', 'five': '5',
+        'six': '6', 'seven': '7', 'eight': '8', 'nine': '9', 'ten': '10',
+        'eleven': '11', 'twelve': '12', 'thirteen': '13', 'fourteen': '14', 'fifteen': '15',
+        'sixteen': '16', 'seventeen': '17', 'eighteen': '18', 'nineteen': '19', 'twenty': '20',
+        'a': '1', 'an': '1'
+    }
+    
+    # Convert word numbers to digits at the very start
+    text_lower = text.lower()
+    for word, number in word_to_number.items():
+        text_lower = re.sub(r'\b' + word + r'\b', number, text_lower)
+    
+    print(f"🔍 Backend remove extraction after word-to-number: {text_lower}")
+    
+    # Check if this is a remove/decrease/increase command
+    remove_indicators = ['remove', 'delete', 'cancel', 'take out']
+    decrease_indicators = ['decrease', 'reduce', 'lower']
+    increase_indicators = ['increase', 'add more', 'more of']
+    
+    operation = None
+    if any(indicator in text_lower for indicator in remove_indicators):
+        operation = 'remove'
+    elif any(indicator in text_lower for indicator in decrease_indicators):
+        operation = 'decrease'
+    elif any(indicator in text_lower for indicator in increase_indicators):
+        operation = 'increase'
+    else:
+        return []  # Not a remove/decrease/increase command
+    
+    # Helper to clean command words from item names
+    def clean_item_name(name):
+        command_words = ['more', 'the', 'a', 'an', 'some', 'please', 'remove', 'delete', 'cancel', 'take', 'out', 'decrease', 'reduce', 'increase', 'by', 'from', 'my', 'cart']
+        words = name.split()
+        cleaned = [w for w in words if w.lower() not in command_words]
+        return ' '.join(cleaned).strip()
+    
+    extracted_items = []
+    
+    # Patterns for remove/decrease/increase with quantities
+    patterns = [
+        # "remove 2 pizza", "delete 3 burger"
+        r'(?:remove|delete|cancel|take\s+out|decrease|reduce|increase)\s+(\d+)\s+(?:more\s+)?(.+?)(?:\s+by\s+\d+)?(?:\s+and|$)',
+        # "decrease pizza by 2", "reduce burger by 3"
+        r'(?:remove|delete|cancel|take\s+out|decrease|reduce|increase)\s+(?:more\s+)?(.+?)\s+by\s+(\d+)',
+        # "remove pizza", "increase salad" (no quantity, default to 1)
+        r'(?:remove|delete|cancel|take\s+out|decrease|reduce|increase)\s+(?:more\s+)?(.+?)(?:\s+and|$|\.|\?|!)'
+    ]
+    
+    # Track if we found a match to avoid checking other patterns
+    found_match = False
+    
+    for pattern in patterns:
+        if found_match:
+            break
+            
+        matches = re.finditer(pattern, text_lower, re.IGNORECASE)
+        for match in matches:
+            groups = match.groups()
+            
+            # Parse based on pattern match
+            if len(groups) == 2 and groups[0].isdigit():
+                # Pattern: "remove 2 pizza"
+                quantity = int(groups[0])
+                item_name = groups[1].strip()
+            elif len(groups) == 2 and groups[1].isdigit():
+                # Pattern: "remove pizza by 2"
+                quantity = int(groups[1])
+                item_name = groups[0].strip()
+            else:
+                # Pattern: "remove pizza" (no quantity, default to 1)
+                quantity = 1
+                item_name = groups[0].strip() if groups else ''
+            
+            # Clean item name
+            item_name = clean_item_name(item_name).rstrip('.,!?')
+            
+            if item_name:  # Only add if name is not empty after cleaning
+                extracted_items.append({
+                    'name': item_name,
+                    'quantity': quantity,
+                    'operation': operation
+                })
+                found_match = True
+                break  # Exit inner loop
+    
+    if extracted_items:
+        print(f"✅ Backend extracted remove/decrease/increase items: {extracted_items}")
+    
+    return extracted_items
+
 def extract_items_from_text(text):
     """
     Return list of {'name': str, 'quantity': int} for items parsed from text.
@@ -1525,12 +1720,36 @@ def extract_items_from_text(text):
       - "2 Fish and Chips and 1 Grilled Salmon"
       - "I want Fish and Chips"
       - "Add 3 burgers"
+      - "Add 3 more burgers"
+      - "two Apple juice and one garden salad"
     Avoids splitting 'Fish and Chips' when it is a single menu item by returning the whole phrase first.
     
     IMPORTANT: Ignores remove/delete/decrease commands to prevent false positives.
     """
     if not text:
         return []
+
+    # Convert word numbers to digits
+    word_to_number = {
+        'one': '1', 'two': '2', 'three': '3', 'four': '4', 'five': '5',
+        'six': '6', 'seven': '7', 'eight': '8', 'nine': '9', 'ten': '10',
+        'eleven': '11', 'twelve': '12', 'thirteen': '13', 'fourteen': '14', 'fifteen': '15',
+        'sixteen': '16', 'seventeen': '17', 'eighteen': '18', 'nineteen': '19', 'twenty': '20',
+        'a': '1', 'an': '1'
+    }
+    
+    # Replace word numbers with digits
+    for word, digit in word_to_number.items():
+        text = re.sub(r'\b' + word + r'\b', digit, text, flags=re.I)
+    
+    print(f"🔍 Backend after word-to-number conversion: {text}")
+
+    # Helper to clean command words from item names
+    def clean_item_name(name):
+        command_words = ['more', 'the', 'a', 'an', 'some', 'please']
+        words = name.split()
+        cleaned = [w for w in words if w.lower() not in command_words]
+        return ' '.join(cleaned).strip()
 
     # First check if this is a remove/delete/decrease command - if so, return empty to let remove patterns handle it
     lower_text = text.lower()
@@ -1540,13 +1759,16 @@ def extract_items_from_text(text):
 
     items = []
 
-    # 1) explicit quantity patterns like "2 Fish and Chips"
-    for m in re.finditer(r'(\d+)\s+([A-ZaZ0-9&\'\-\s]+?)(?=(?:\s+(?:and|,|&)\s+\d|\s*$|[.,!?]))', text, re.I):
+    # 1) explicit quantity patterns like "2 Fish and Chips" or "2 more Fish and Chips"
+    for m in re.finditer(r'(\d+)\s+(?:more\s+)?([A-Za-z0-9&\'\-\s]+?)(?=(?:\s+(?:and|,|&)\s+\d|\s*$|[.,!?]))', text, re.I):
         qty = int(m.group(1))
         name = m.group(2).strip().rstrip('.,!?')
-        items.append({'name': name, 'quantity': qty})
+        name = clean_item_name(name)
+        if name:  # Only add if name is not empty after cleaning
+            items.append({'name': name, 'quantity': qty})
 
     if items:
+        print(f"✅ Backend extracted items (pattern 1): {items}")
         return items
 
     # 2) "I want X and Y" -> multiple without numbers. But first check if whole phrase is a single item.
@@ -1554,10 +1776,14 @@ def extract_items_from_text(text):
     if m:
         raw = m.group(1).strip().rstrip('.,!?')
         norm_raw = _normalize_text(raw)
-        # if the raw phrase looks like "2 grilled salmon" capture leading number
-        leading_num = re.match(r'^(\d+)\s+(.+)$', raw)
+        # if the raw phrase looks like "2 more grilled salmon" or "2 grilled salmon" capture leading number
+        leading_num = re.match(r'^(\d+)\s+(?:more\s+)?(.+)$', raw)
         if leading_num:
-            return [{'name': leading_num.group(2).strip(), 'quantity': int(leading_num.group(1))}]
+            name = clean_item_name(leading_num.group(2).strip())
+            if name:
+                result = [{'name': name, 'quantity': int(leading_num.group(1))}]
+                print(f"✅ Backend extracted items (pattern 2 with qty): {result}")
+                return result
 
         # If backend has access to menu list it could check here; otherwise return split parts as items
         # Try to split into parts but avoid splitting common "X and Y" that might be single item by returning joined phrase first
@@ -1572,20 +1798,27 @@ def extract_items_from_text(text):
                 return [{'name': name, 'quantity': qty}]
         else:
             for p in parts:
-                pm = re.match(r'^(?:\b(\d+)\b\s*)?(.+)$', p.strip())
+                pm = re.match(r'^(?:\b(\d+)\b\s*)?(?:more\s+)?(.+)$', p.strip())
                 if pm:
                     qty = int(pm.group(1)) if pm.group(1) else 1
                     name = pm.group(2).strip().rstrip('.,!?')
-                    items.append({'name': name, 'quantity': qty})
+                    name = clean_item_name(name)
+                    if name:  # Only add if name is not empty after cleaning
+                        items.append({'name': name, 'quantity': qty})
             if items:
+                print(f"✅ Backend extracted items (pattern 2 multi-item): {items}")
                 return items
 
-    # 3) last fallback: look for "add X" pattern
-    m = re.search(r'\badd\s+(?:\b(\d+)\b\s*)?(.+?)(?:[.?!]|$)', text, re.I)
+    # 3) last fallback: look for "add X more Y" or "add X Y" pattern
+    m = re.search(r'\badd\s+(?:\b(\d+)\b\s*)?(?:more\s+)?(.+?)(?:[.?!]|$)', text, re.I)
     if m:
         qty = int(m.group(1)) if m.group(1) else 1
         name = m.group(2).strip().rstrip('.,!?')
-        return [{'name': name, 'quantity': qty}]
+        name = clean_item_name(name)
+        if name:
+            result = [{'name': name, 'quantity': qty}]
+            print(f"✅ Backend extracted items (add pattern): {result}")
+            return result
 
     return []
 

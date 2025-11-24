@@ -16,21 +16,22 @@ const ChatBot = ({ isOpen, onClose }) => {
   const [isListening, setIsListening] = useState(false);
   const [transcript, setTranscript] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
-  // const [isCheckoutMode, setIsCheckoutMode] = useState(false);
-  const [hasAskedForAddons, setHasAskedForAddons] = useState(false);
   const [textInput, setTextInput] = useState('');
   const [inputMode, setInputMode] = useState('voice'); // 'voice' or 'text'
   const [isTyping, setIsTyping] = useState(false);
   const [aiServiceStatus, setAiServiceStatus] = useState('checking'); // 'connected', 'disconnected', 'checking'
-  const [showReceiptModal, setShowReceiptModal] = useState(false); // optional if needed elsewhere
-  const [receiptData, setReceiptData] = useState(null);
-  // Add these state variables to your existing ChatBot component
   const [userMood, setUserMood] = useState(null);
   const [empathyLevel, setEmpathyLevel] = useState('standard');
-
-  // bulk / multi-category flow state (were referenced but not defined -> runtime crash)
+  const [_HAS_ASKED_FOR_ADDONS, setHasAskedForAddons] = useState(false);
+  const [showReceiptModal, setShowReceiptModal] = useState(false);
+  const [receiptData, setReceiptData] = useState(null);
   const [bulkQuantityMode, setBulkQuantityMode] = useState(null);
   const [multiCategoryBulkMode, setMultiCategoryBulkMode] = useState(null);
+  
+  // Voice response states
+  const [voiceEnabled, setVoiceEnabled] = useState(true);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const speechSynthesisRef = useRef(null);
   
   const dispatch = useDispatch();
   const { data: menuData } = useQuery(GET_MENU_ITEMS);
@@ -58,23 +59,37 @@ const ChatBot = ({ isOpen, onClose }) => {
   // Check AI service health
   const checkAIServiceHealth = async () => {
     try {
+      // Use AbortController for timeout
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000);
+      
       const response = await fetch(`${CHATBOT_SERVICE_URL}/health`, {
         method: 'GET',
-        timeout: 5000
+        signal: controller.signal
       });
+      
+      clearTimeout(timeoutId);
       
       if (response.ok) {
         const healthData = await response.json();
         if (healthData.ai_status === 'rate_limited') {
           setAiServiceStatus('rate_limited');
+          console.log('⚠️ AI service rate limited');
         } else {
           setAiServiceStatus('connected');
+          console.log('✅ AI service connected');
         }
       } else {
         setAiServiceStatus('disconnected');
+        console.warn('⚠️ AI service responded with error:', response.status);
       }
     } catch (error) {
       setAiServiceStatus('disconnected');
+      if (error.name === 'AbortError') {
+        console.warn('⚠️ AI service health check timeout');
+      } else {
+        console.warn('⚠️ AI service unreachable:', error.message);
+      }
     }
   };
   
@@ -89,7 +104,6 @@ const ChatBot = ({ isOpen, onClose }) => {
       clearInterval(healthCheckInterval);
       clearAISession();
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   
   // Add function to handle clear chat
@@ -121,7 +135,12 @@ const ChatBot = ({ isOpen, onClose }) => {
       setEmpathyLevel('standard');
     }
   };
+  // Keep a ref to the current handleUserInput to avoid stale closures in the speech recognition callback
+  // Keep a ref to the current handleUserInput to avoid stale closures in the speech recognition callback
+  const handleUserInputRef = useRef(null);
+
   useEffect(() => {
+    // Initialize Speech Recognition
     if (typeof window !== 'undefined' && ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window)) {
       const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
       recognitionRef.current = new SpeechRecognition();
@@ -129,8 +148,10 @@ const ChatBot = ({ isOpen, onClose }) => {
       recognitionRef.current.continuous = false;
       recognitionRef.current.interimResults = true;
       recognitionRef.current.lang = 'en-US';
+      recognitionRef.current.maxAlternatives = 1;
 
       recognitionRef.current.onstart = () => {
+        console.log('🎤 Speech recognition started');
         setIsListening(true);
         setTranscript('');
       };
@@ -140,34 +161,78 @@ const ChatBot = ({ isOpen, onClose }) => {
         let interimTranscript = '';
 
         for (let i = event.resultIndex; i < event.results.length; i++) {
+          const transcriptText = event.results[i][0].transcript;
           if (event.results[i].isFinal) {
-            finalTranscript += event.results[i][0].transcript;
+            finalTranscript += transcriptText;
           } else {
-            interimTranscript += event.results[i][0].transcript;
+            interimTranscript += transcriptText;
           }
         }
 
+        // Show live transcript
         setTranscript(finalTranscript || interimTranscript);
 
+        // Process final transcript
         if (finalTranscript) {
-          handleUserInput(finalTranscript);
+          console.log('🎤 Final transcript:', finalTranscript);
+          // Use the ref to call the latest version of handleUserInput
+          if (handleUserInputRef.current) {
+            handleUserInputRef.current(finalTranscript);
+          }
         }
       };
 
       recognitionRef.current.onerror = (event) => {
         console.error('Speech recognition error:', event.error);
         setIsListening(false);
-        addMessage('assistant', 'Sorry, I couldn\'t hear you clearly. Please try again.');
+        
+        // Better error messages based on error type
+        let errorMessage = 'Sorry, I couldn\'t hear you clearly.';
+        switch (event.error) {
+          case 'no-speech':
+            errorMessage = 'I didn\'t hear anything. Please try again.';
+            break;
+          case 'audio-capture':
+            errorMessage = 'Microphone not found. Please check your device.';
+            break;
+          case 'not-allowed':
+            errorMessage = 'Microphone access denied. Please allow microphone access.';
+            break;
+          case 'network':
+            errorMessage = 'Network error. Please check your connection.';
+            break;
+          default:
+            errorMessage = `Voice recognition error: ${event.error}. Please try again.`;
+        }
+        
+        if (event.error !== 'aborted') {
+          addMessage('assistant', errorMessage);
+          speak(errorMessage);
+        }
       };
 
       recognitionRef.current.onend = () => {
+        console.log('🎤 Speech recognition ended');
         setIsListening(false);
       };
     }
 
+    // Initialize Speech Synthesis
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      speechSynthesisRef.current = window.speechSynthesis;
+      console.log('🔊 Speech synthesis available');
+    }
+
     return () => {
       if (recognitionRef.current) {
-        recognitionRef.current.stop();
+        try {
+          recognitionRef.current.stop();
+        } catch (e) {
+          console.error('Error stopping recognition:', e);
+        }
+      }
+      if (speechSynthesisRef.current) {
+        speechSynthesisRef.current.cancel();
       }
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -246,8 +311,58 @@ const ChatBot = ({ isOpen, onClose }) => {
     try {
       const d = timestamp ? new Date(timestamp) : new Date();
       return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    } catch (e) {
+    } catch {
       return '';
+    }
+  };
+
+  // Text-to-Speech function
+  const speak = (text) => {
+    if (!voiceEnabled || !text) return;
+    
+    if (speechSynthesisRef.current) {
+      // Cancel any ongoing speech
+      speechSynthesisRef.current.cancel();
+      
+      // Clean the text (remove JSON, special characters)
+      const cleanText = stripJsonFromText(text)
+        .replace(/[{}[\]"]/g, '')
+        .replace(/\n/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      
+      if (!cleanText) return;
+      
+      const utterance = new SpeechSynthesisUtterance(cleanText);
+      utterance.lang = 'en-US';
+      utterance.rate = 1.0;
+      utterance.pitch = 1.0;
+      utterance.volume = 1.0;
+      
+      utterance.onstart = () => {
+        console.log('🔊 Speaking:', cleanText);
+        setIsSpeaking(true);
+      };
+      
+      utterance.onend = () => {
+        console.log('🔊 Finished speaking');
+        setIsSpeaking(false);
+      };
+      
+      utterance.onerror = (event) => {
+        console.error('Speech synthesis error:', event);
+        setIsSpeaking(false);
+      };
+      
+      speechSynthesisRef.current.speak(utterance);
+    }
+  };
+
+  // Stop speaking function
+  const stopSpeaking = () => {
+    if (speechSynthesisRef.current) {
+      speechSynthesisRef.current.cancel();
+      setIsSpeaking(false);
     }
   };
 
@@ -326,6 +441,11 @@ const ChatBot = ({ isOpen, onClose }) => {
           timestamp: new Date()
         };
         setMessages(prev => [...prev, newMessage]);
+        
+        // Speak the assistant message if voice is enabled and it's text
+        if (type === 'assistant' && messageType === 'text' && typeof content === 'string') {
+          setTimeout(() => speak(content), 100);
+        }
       }, delay);
     } else {
       // Immediate message (no delay)
@@ -342,24 +462,40 @@ const ChatBot = ({ isOpen, onClose }) => {
       // If this is an assistant message with no delay, make sure typing is off
       if (type === 'assistant') {
         setIsTyping(false);
+        
+        // Speak the assistant message if voice is enabled and it's text
+        if (messageType === 'text' && typeof content === 'string') {
+          setTimeout(() => speak(content), 100);
+        }
       }
     }
   };
 
   const startListening = () => {
-    if (recognitionRef.current && !isListening) {
+    if (recognitionRef.current && !isListening && !isProcessing) {
       try {
+        // Stop any ongoing speech before listening
+        stopSpeaking();
         recognitionRef.current.start();
+        console.log('🎤 Starting speech recognition...');
       } catch (error) {
         console.error('Error starting speech recognition:', error);
-        addMessage('assistant', 'Voice recognition is not available on this device.');
+        const errorMsg = 'Voice recognition is not available. Please try using text mode.';
+        addMessage('assistant', errorMsg);
+        speak(errorMsg);
       }
     }
   };
 
   const stopListening = () => {
     if (recognitionRef.current && isListening) {
-      recognitionRef.current.stop();
+      try {
+        recognitionRef.current.stop();
+        console.log('🎤 Stopping speech recognition...');
+      } catch (error) {
+        console.error('Error stopping speech recognition:', error);
+        setIsListening(false);
+      }
     }
   };
 
@@ -431,9 +567,18 @@ const ChatBot = ({ isOpen, onClose }) => {
     // quick local handling for explicit checkout phrases
     const placeOrderPhrases = ['place order', 'proceed with order', 'checkout', 'order now', 'complete order'];
     if (placeOrderPhrases.some(p => userText.toLowerCase().includes(p))) {
+      // Check if cart has items
+      if (!cartItems || cartItems.length === 0) {
+        addMessage('assistant', 'Your cart is empty. Please add some items before placing an order.');
+        setIsProcessing(false);
+        setTranscript('');
+        return;
+      }
+      
       // show CartMessage summary in chat and ask for confirmation
       const rawReceipt = generateReceiptFromCart();
       const sanitized = sanitizeReceiptForChat(rawReceipt);
+      console.log('🛒 Cart confirm - sanitized:', sanitized);
       // Use the sanitized minimal shape for CartMessage to avoid runtime errors
       addMessage('assistant', 'Would you like to proceed to place your order?', sanitized, 200, 'cart_confirm');
       setIsProcessing(false);
@@ -466,27 +611,38 @@ const ChatBot = ({ isOpen, onClose }) => {
         total: item.totalPrice || (item.price * item.quantity)
       }));
       
+      // Use AbortController for timeout
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+      
       // Call AI chatbot service
+      console.log('📤 Sending message to AI:', userText);
       const response = await fetch(`${CHATBOT_SERVICE_URL}/chat`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
+        signal: controller.signal,
         body: JSON.stringify({
           message: userText,
           session_id: SESSION_ID,
           cart_items: cartData,
-          user_mood: userMood,        // Add this line
-          empathy_level: empathyLevel  // Add this line
+          user_mood: userMood,
+          empathy_level: empathyLevel
         })
       });
       
+      clearTimeout(timeoutId);
+      
       if (!response.ok) {
-        throw new Error('Chatbot service unavailable');
+        const errorText = await response.text().catch(() => 'Unknown error');
+        console.error('❌ Chatbot service error:', response.status, errorText);
+        throw new Error(`Chatbot service error: ${response.status}`);
       }
       
       const data = await response.json();
-      console.log("[ChatBot] /chat response", data);
+      console.log('📥 Received AI response:', data);
+      
       if (!data.success) {
         throw new Error(data.error || 'AI response error');
       }
@@ -501,6 +657,14 @@ const ChatBot = ({ isOpen, onClose }) => {
 
       // Stop typing animation before processing response
       setIsTyping(false);
+
+      // DEBUG: Log full response from backend
+      console.log('📥 Backend response:', {
+        response: data.response,
+        action: data.action_data?.action,
+        action_data: data.action_data,
+        success: data.success
+      });
 
       // If server returned an early action, handle greetings specially so we don't duplicate messages.
       const earlyAction = data.action_data && data.action_data.action;
@@ -562,13 +726,27 @@ const ChatBot = ({ isOpen, onClose }) => {
       }
       
     } catch (error) {
-      console.error('AI Chatbot Error:', error);
+      console.error('❌ AI Chatbot Error:', error);
       
       // Stop typing animation on error
       setIsTyping(false);
       
-      // Fallback to basic responses if AI service is down
-      handleFallbackResponse(userText);
+      // Provide specific error message based on error type
+      let errorMessage = '';
+      if (error.name === 'AbortError') {
+        errorMessage = 'The request took too long. Please try again.';
+      } else if (error.message.includes('Failed to fetch')) {
+        errorMessage = 'Cannot connect to AI service. Please make sure the chatbot service is running.';
+      } else if (error.message.includes('NetworkError')) {
+        errorMessage = 'Network error. Please check your connection.';
+      } else {
+        errorMessage = `Error: ${error.message}`;
+      }
+      
+      addMessage('assistant', errorMessage);
+      speak(errorMessage);
+      
+      
     }
     
     setIsProcessing(false);
@@ -578,48 +756,28 @@ const ChatBot = ({ isOpen, onClose }) => {
   const processAIResponse = async (response, actionData) => {
     const delay = actionData?.response_delay || 1500;
 
-    // Robustly ensure add-actions include items: if backend omitted items, try to parse from response text
-    if (actionData && actionData.action === 'add' && (!Array.isArray(actionData.items) || actionData.items.length === 0)) {
-      // Try to parse explicit items/quantities from the actionData fallback fields first
-      let parsed = [];
-      // If backend included a raw text field or name, try to use it
-      if (actionData.raw_text) {
-        parsed = parseItemsFromText(actionData.raw_text);
-      }
-      // Otherwise try parsing the visible assistant response
-      if ((!parsed || parsed.length === 0) && typeof response === 'string') {
-        parsed = parseItemsFromText(response);
-      }
-      // If still empty, try last-resort: parse the original user message from the most recent user message
-      if ((!parsed || parsed.length === 0) && messages) {
-        const lastUser = [...messages].reverse().find(m => m.type === 'user');
-        if (lastUser && lastUser.content) {
-          parsed = parseItemsFromText(lastUser.content);
-        }
-      }
-
-      if (parsed && parsed.length > 0) {
-        actionData.items = parsed;
-      } else {
-        actionData.items = [];
-      }
+    
+    if (typeof response === 'string' && response.trim().length > 0) {
+      addMessage('assistant', response, null, delay);
     }
 
+    
+
     // helper: pick a friendly positive comment for an added item
-    const pickPositiveComment = (actionItem, menuItem) => {
-      if (actionItem && actionItem.human_comment) return actionItem.human_comment;
-      if (menuItem && menuItem.description) {
-        const first = menuItem.description.split('.')[0].trim();
-        if (first) return `${first}. A customer favorite!`;
-      }
-      if (menuItem && menuItem.category) {
-        const cat = menuItem.category.toLowerCase();
-        if (cat.includes('pizza')) return 'Cheesy and satisfying — a great pick!';
-        if (cat.includes('salad')) return 'Fresh and crisp — a light, tasty choice.';
-        if (cat.includes('dessert')) return 'Sweet and delightful — perfect to finish your meal.';
-      }
-      return 'Great pick — many customers love this!';
-    };
+    // const pickPositiveComment = (actionItem, menuItem) => {
+    //   if (actionItem && actionItem.human_comment) return actionItem.human_comment;
+    //   if (menuItem && menuItem.description) {
+    //     const first = menuItem.description.split('.')[0].trim();
+    //     if (first) return `${first}. A customer favorite!`;
+    //   }
+    //   if (menuItem && menuItem.category) {
+    //     const cat = menuItem.category.toLowerCase();
+    //     if (cat.includes('pizza')) return 'Cheesy and satisfying — a great pick!';
+    //     if (cat.includes('salad')) return 'Fresh and crisp — a light, tasty choice.';
+    //     if (cat.includes('dessert')) return 'Sweet and delightful — perfect to finish your meal.';
+    //   }
+    //   return 'Great pick — many customers love this!';
+    // };
 
     // Helper to create and show receipt and clear cart
     const placeOrderAndShowReceipt = (orderSourceData = null) => {
@@ -656,11 +814,7 @@ const ChatBot = ({ isOpen, onClose }) => {
       // Save receipt in state (optional)
       setReceiptData(receiptContent);
 
-      // Friendly assistant confirmation (sanitized by addMessage)
-      addMessage('assistant', 'Your order has been placed successfully! Thank you for choosing us.', null, delay);
-
-      // Show receipt as a special message (we reuse menuItem slot to carry receiptContent)
-      addMessage('assistant', 'Here is your receipt.', receiptContent, 1000, 'receipt');
+      addMessage('assistant', null, receiptContent, 0, 'receipt');
     };
 
     // Handle different action types
@@ -669,13 +823,7 @@ const ChatBot = ({ isOpen, onClose }) => {
       case 'add':
         {
           const items = actionData.items || [];
-          const added = [];
-          const notFound = [];
-          const positiveNotes = [];
-
-          // If backend didn't include items, nothing to do — show assistant response
           if (!items || items.length === 0) {
-            addMessage('assistant', response, null, delay);
             break;
           }
 
@@ -689,8 +837,6 @@ const ChatBot = ({ isOpen, onClose }) => {
                 price: menuItem.price || 0,
                 quantity: qty
               }));
-              added.push(`${qty} ${menuItem.name}`);
-              positiveNotes.push(pickPositiveComment(item, menuItem));
             } else {
               // fallback: create a synthetic cart item when menu lookup fails
               const fallbackId = `custom-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;
@@ -701,22 +847,7 @@ const ChatBot = ({ isOpen, onClose }) => {
                 price: Number(item.price || 0) || 0,
                 quantity: qty
               }));
-              added.push(`${qty} ${fallbackName || 'item'}`);
-              notFound.push(fallbackName || item.name || 'unknown');
-              positiveNotes.push(item.human_comment || 'Nice choice!');
             }
-          }
-
-          if (added.length > 0) {
-            // If some items were fuzzy-added, give a friendly confirmation with a positive note
-            const confirmMsgBase = notFound.length > 0
-              ? `Added ${added.join(' and ')} to your cart (some items were added as custom entries because they weren't found on the menu).`
-              : `Added ${added.join(' and ')} to your cart.`;
-            // include one concise positive sentence (avoid long messages)
-            const positiveMsg = positiveNotes.length > 0 ? ` ${positiveNotes[0]}` : '';
-            addMessage('assistant', `${confirmMsgBase}${positiveMsg}`, null, delay);
-          } else {
-            addMessage('assistant', response, null, delay);
           }
         }
           break;
@@ -724,8 +855,6 @@ const ChatBot = ({ isOpen, onClose }) => {
       case 'add_multiple':
         // Handle adding multiple different items to cart
         if (actionData.items && actionData.items.length > 0) {
-          let addedItems = [];
-          let positiveNotes = [];
           for (const item of actionData.items) {
             const qty = Number(item.quantity || 1);
             const menuItem = findMenuItemByName(item.name);
@@ -736,8 +865,6 @@ const ChatBot = ({ isOpen, onClose }) => {
                 price: menuItem.price || 0,
                 quantity: qty
               }));
-              addedItems.push(`${qty} ${menuItem.name}`);
-              positiveNotes.push(pickPositiveComment(item, menuItem));
             } else {
               const fallbackId = `custom-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;
               const fallbackName = (item.name || '').trim();
@@ -747,20 +874,14 @@ const ChatBot = ({ isOpen, onClose }) => {
                 price: Number(item.price || 0) || 0,
                 quantity: qty
               }));
-              addedItems.push(`${qty} ${fallbackName}`);
-              positiveNotes.push(item.human_comment || 'Nice choice!');
             }
           }
-          const multiItemResponse = `Great! I've added ${addedItems.join(' and ')} to your cart.${positiveNotes.length ? ' ' + positiveNotes[0] : ''}`;
-          addMessage('assistant', multiItemResponse, null, delay);
         }
         break;
 
       case 'add_multiple_partial':
         // Handle adding multiple items where some weren't found
         if (actionData.items && actionData.items.length > 0) {
-          let addedItems = [];
-          let positiveNotes = [];
           for (const item of actionData.items) {
             const qty = Number(item.quantity || 1);
             const menuItem = findMenuItemByName(item.name);
@@ -771,8 +892,6 @@ const ChatBot = ({ isOpen, onClose }) => {
                 price: menuItem.price || 0,
                 quantity: qty
               }));
-              addedItems.push(`${qty} ${menuItem.name}`);
-              positiveNotes.push(pickPositiveComment(item, menuItem));
             } else {
               const fallbackId = `custom-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;
               const fallbackName = (item.name || '').trim();
@@ -782,186 +901,123 @@ const ChatBot = ({ isOpen, onClose }) => {
                 price: Number(item.price || 0) || 0,
                 quantity: qty
               }));
-              addedItems.push(`${qty} ${fallbackName}`);
-              positiveNotes.push(item.human_comment || 'Nice choice!');
             }
           }
-          
-          const notFoundItems = actionData.not_found_items || [];
-          let partialResponse = `I've added ${addedItems.join(' and ')} to your cart.`;
-          if (notFoundItems.length > 0) {
-            partialResponse += ` However, I couldn't find ${notFoundItems.join(' and ')} on our menu. Would you like to see our available items?`;
-          }
-          if (positiveNotes.length) partialResponse += ` ${positiveNotes[0]}`;
-          addMessage('assistant', partialResponse, null, delay);
         }
         break;
         
-      case 'item_not_found':
+      case 'item_not_found': {
         // Handle when requested items are not found
-        const notFoundItems = actionData.not_found_items || [];
-        if (notFoundItems.length > 0) {
-          const notFoundResponse = `I'm sorry, I couldn't find ${notFoundItems.join(' and ')} on our menu. Would you like me to show you our available items instead?`;
-          addMessage('assistant', notFoundResponse, null, delay);
-        } else {
-          addMessage('assistant', "I'm sorry, I couldn't find that item on our menu.", null, delay);
-        }
         break;
+      }
         
       case 'remove': {
-        console.log('🗑️ Processing remove action with items:', actionData.items);
         if (actionData.items && actionData.items.length > 0) {
           for (const item of actionData.items) {
-            console.log('🔍 Looking for item to remove:', item.name, 'with quantity:', item.quantity);
-            const cartItem = cartItems.find(ci => ci.name.toLowerCase().includes(item.name.toLowerCase()));
-            console.log('🎯 Found cart item:', cartItem);
-            
+            const qty = Number(item.quantity || 0);
+            let cartItem = null;
+            if (item.id) {
+              cartItem = cartItems.find(ci => ci.id === item.id) || null;
+            }
+            if (!cartItem && item.name) {
+              const matches = findCartItemsByName(item.name);
+              cartItem = matches[0] || null;
+            }
             if (cartItem) {
-              if (item.quantity && item.quantity < cartItem.quantity) {
-                console.log('⬇️ Decreasing quantity from', cartItem.quantity, 'to', cartItem.quantity - item.quantity);
-                dispatch(updateQuantity({ id: cartItem.id, quantity: cartItem.quantity - item.quantity }));
+              if (qty > 0 && qty < cartItem.quantity) {
+                dispatch(updateQuantity({ id: cartItem.id, quantity: cartItem.quantity - qty }));
               } else {
-                console.log('🗑️ Removing item completely:', cartItem.name);
                 dispatch(removeFromCart(cartItem.id));
               }
-            } else {
-              console.log('❌ Cart item not found for:', item.name);
             }
           }
         }
-        addMessage('assistant', response, null, delay);
         break;
       }
         
       case 'remove_all':
-        // Handle remove all of a specific item type
         if (actionData.target_item) {
           const targetItem = actionData.target_item;
-          // Find all cart items that match the target item with more precise matching
-          const itemsToRemove = cartItems.filter(cartItem => {
-            const cartItemName = cartItem.name.toLowerCase();
-            const targetItemName = targetItem.toLowerCase();
-            
-            // Exact match or partial match in either direction
-            return cartItemName === targetItemName || 
-                   cartItemName.includes(targetItemName) || 
-                   targetItemName.includes(cartItemName) ||
-                   // Word boundary matching for better accuracy
-                   cartItemName.split(' ').some(word => word.includes(targetItemName) || targetItemName.includes(word));
+          console.log('🗑️ Processing remove_all for:', targetItem);
+          
+          const nameMatches = findCartItemsByName(targetItem);
+          console.log('🗑️ Name matches:', nameMatches);
+          
+          const categoryMatches = cartItems.filter(ci => {
+            const menuItem = (menuData?.menuItems || []).find(mi => mi.id === ci.id || _normalize(mi.name) === _normalize(ci.name));
+            if (!menuItem) return false;
+            const tgt = _tokens(targetItem);
+            const cat = _tokens(menuItem.category || '');
+            return _score(tgt, cat) >= 0.5 || menuItem.category?.toLowerCase().includes(targetItem.toLowerCase());
           });
+          console.log('🗑️ Category matches:', categoryMatches);
+          
+          const byIdMatches = actionData.items ? actionData.items.map(it => it.id).filter(Boolean).map(id => cartItems.find(ci => ci.id === id)).filter(Boolean) : [];
+          
+          const itemsToRemove = [...new Set([...nameMatches, ...categoryMatches, ...byIdMatches])];
+          console.log('🗑️ Items to remove:', itemsToRemove);
           
           if (itemsToRemove.length > 0) {
-            // Remove all matching items
             itemsToRemove.forEach(item => {
+              console.log('🗑️ Dispatching removeFromCart for:', item.name, item.id);
               dispatch(removeFromCart(item.id));
             });
-            
-            const totalQuantity = itemsToRemove.reduce((sum, item) => sum + item.quantity, 0);
-            const itemNames = [...new Set(itemsToRemove.map(item => item.name))].join(', ');
-            
-            addMessage('assistant', `I've removed all ${itemNames} from your cart (${totalQuantity} items total). Anything else you'd like to order?`, null, delay);
+            // Add confirmation message
+            addMessage('assistant', `Removed all ${targetItem} from your cart.`);
           } else {
-            addMessage('assistant', `I couldn't find any ${targetItem} items in your cart.`, null, delay);
+            console.log('🗑️ No items found to remove');
+            addMessage('assistant', `I couldn't find any ${targetItem} in your cart to remove.`);
           }
         }
         break;
 
       case 'update':
-        // Handle quantity updates (increase/decrease)
         if (actionData.operation) {
           const operation = actionData.operation; // 'increase' or 'decrease'
           const targetItem = actionData.target_item || actionData.target;
           const quantity = actionData.quantity || 1;
-          
-          // Find the cart item to update
-          const cartItem = cartItems.find(ci => 
-            ci.name.toLowerCase().includes(targetItem.toLowerCase()) ||
-            targetItem.toLowerCase().includes(ci.name.toLowerCase())
-          );
+          let cartItem = null;
+          if (actionData.id) {
+            cartItem = cartItems.find(ci => ci.id === actionData.id) || null;
+          }
+          if (!cartItem && targetItem) {
+            cartItem = findCartItemsByName(targetItem)[0] || null;
+          }
           
           if (cartItem) {
             if (operation === 'increase') {
               dispatch(updateQuantity({ id: cartItem.id, quantity: cartItem.quantity + quantity }));
-              addMessage('assistant', `I've increased ${cartItem.name} by ${quantity}. Your cart has been updated!`, null, delay);
             } else if (operation === 'decrease') {
               const newQuantity = cartItem.quantity - quantity;
               if (newQuantity <= 0) {
-                // Remove the item completely when quantity reaches 0 or below
                 dispatch(removeFromCart(cartItem.id));
-                addMessage('assistant', `I've removed ${cartItem.name} from your cart completely since the quantity reached zero.`, null, delay);
               } else {
-                // Update quantity if still positive
                 dispatch(updateQuantity({ id: cartItem.id, quantity: newQuantity }));
-                addMessage('assistant', `I've decreased ${cartItem.name} by ${quantity}. Now you have ${newQuantity} in your cart.`, null, delay);
               }
             }
-          } else {
-            addMessage('assistant', `I couldn't find "${targetItem}" in your cart to update.`, null, delay);
           }
-        } else {
-          addMessage('assistant', response, null, delay);
         }
         break;
         
       case 'show_menu':
-        // If the user is detected as upset, prioritize empathy and ask before opening the menu.
-        if (userMood && userMood.emotion === 'negative') {
-          const empathic = userMood.intensity === 'high'
-            ? "I'm really sorry you're not feeling well. I can suggest some comforting meals that might help — would you like that, or should I open the full menu?"
-            : "I'm sorry to hear you're not feeling great. I can suggest a few comforting options, or I can open the menu — which would you prefer?";
-          addMessage('assistant', empathic, null, delay);
-        } else {
-          // Normal behaviour: open the menu panel and post a short helper message.
-          openMenuPanel(actionData?.category || null);
-          addMessage('assistant', 'Opening the menu for you. Browse categories and items in the menu panel.', null, delay);
-        }
+        openMenuPanel(actionData?.category || null);
         break;
         
       case 'show_category':
         if (actionData.category) {
-          const categoryItems = menuData?.menuItems?.filter(item => 
-            item.category.toLowerCase() === actionData.category.toLowerCase() && 
-            !item.isAddon &&
-            item.available
-          ) || [];
-          
-          let categoryText = `Here are our ${actionData.category} options:\n\n`;
-          categoryItems.forEach(item => {
-            categoryText += `- ${item.name} - $${item.price}\n`;
-          });
-          categoryText += "\nYou can add items to your cart by saying 'Add [item name]' or 'I want [quantity] [item name]'.";
-          
-          addMessage('assistant', categoryText, null, delay);
-        } else {
-          addMessage('assistant', response, null, delay);
+          openMenuPanel(actionData.category);
         }
         break;
         
       case 'show_cart':
-        if (cartItems.length === 0) {
-          addMessage('assistant', 'Your cart is currently empty.', null, delay);
-        } else {
-          let cartText = 'Here are the items in your cart:\n\n';
-          cartItems.forEach(item => {
-            cartText += `- ${item.name} - $${item.price} x ${item.quantity} = $${item.totalPrice || (item.price * item.quantity)}\n`;
-          });
-          cartText += `\nTotal: $${cartItems.reduce((sum, item) => sum + (item.totalPrice || (item.price * item.quantity)), 0)}`;
-          addMessage('assistant', cartText, null, delay);
-        }
         break;
         
       case 'clear_cart':
         dispatch(clearCart());
-        addMessage('assistant', 'Your cart has been cleared.', null, delay);
         break;
         
       case 'checkout':
-        // Handle checkout process
-        if (cartItems.length === 0) {
-          addMessage('assistant', 'Your cart is empty. Please add items to your cart before checking out.', null, delay);
-        } else {
-          // Simulate processing and place order
-          addMessage('assistant', 'Processing your order...', null, delay);
+        if (cartItems.length > 0) {
           setTimeout(() => {
             placeOrderAndShowReceipt();
           }, 1200);
@@ -974,10 +1030,8 @@ const ChatBot = ({ isOpen, onClose }) => {
         break;
 
       case 'bulk_quantity':
-        // Handle bulk quantity mode
         if (actionData.item_type) {
           setBulkQuantityMode({ quantity: 1, itemType: actionData.item_type });
-          addMessage('assistant', `Sure, how many ${actionData.item_type}s would you like to add?`, null, delay);
         }
         break;
         
@@ -990,115 +1044,32 @@ const ChatBot = ({ isOpen, onClose }) => {
         break;
         
       case 'ask_addons':
-        // Handle asking for addons
         if (actionData.item_name) {
           setHasAskedForAddons(true);
-          addMessage('assistant', `Would you like to add any addons to your ${actionData.item_name}?`, null, delay);
         }
         break;
         
       case 'confirm_addons':
-        // Handle confirming addons
         if (actionData.item_name) {
           setHasAskedForAddons(false);
-          addMessage('assistant', `Great! Your ${actionData.item_name} with addons has been added to your cart.`, null, delay);
         }
         break;
         
       case 'cancel_addons':
-        // Handle canceling addons
         if (actionData.item_name) {
           setHasAskedForAddons(false);
-          addMessage('assistant', `No addons added to your ${actionData.item_name}.`, null, delay);
         }
         break;
         
       case 'unknown':
-        // Handle unknown commands
-        addMessage('assistant', 'I didn\'t understand that. Could you please rephrase your request?', null, delay);
         break;
         
       default:
-        addMessage('assistant', response, null, delay);
         break;
     }
   };
   
-  const handleFallbackResponse = (userText) => {
-    const lowerText = userText.toLowerCase();
-    
-    // Check for greetings with names or emotional context
-    if (lowerText.includes('hi') || lowerText.includes('hello') || lowerText.includes('hey') || lowerText.match(/\bgood (morning|afternoon|evening)\b/)) {
-      // Check for emotional context
-      const negativeEmotions = ['worst', 'bad', 'terrible', 'awful', 'sad', 'depressed', 'upset', 'angry', 'horrible', 'miserable'];
-      const hasNegativeEmotion = negativeEmotions.some(emotion => lowerText.includes(emotion));
-      
-      if (hasNegativeEmotion) {
-        // Show empathy for negative emotions
-        let greetingResponse;
-        const nameMatch = userText.match(/(?:hi|hello|hey)[,!\s]*([A-Za-z]+)/i);
-        const name = nameMatch ? nameMatch[1] : null;
-        
-        if (name) {
-          greetingResponse = `Oh no, ${name} — I'm really sorry to hear that. I wish I could make it better right away. Can I suggest something comforting from our menu or place an order for you?`;
-        } else {
-          greetingResponse = "I'm really sorry to hear that. I wish I could make it better right away. Can I suggest something comforting from our menu or place an order for you?";
-        }
-        
-        addMessage('assistant', greetingResponse, null, 1500);
-        // Don't auto-show menu after empathy response
-        return;
-      } else {
-        // Standard greeting
-        let greetingResponse;
-        
-        // Extract name if present
-        const nameMatch = userText.match(/(?:hi|hello|hey)[,!\s]*([A-Za-z]+)/i);
-        const name = nameMatch ? nameMatch[1] : null;
-        
-        if (name) {
-          greetingResponse = `Hello, ${name}! So glad you're here. I'm your friendly assistant — I can recommend favorites, customize meals, or place your order. What are you in the mood for today?`;
-        } else {
-          greetingResponse = "Hello there! I'm your friendly assistant — I can recommend favorites, help with customizations, or place an order for you. What are you in the mood for today?";
-        }
-        
-        addMessage('assistant', greetingResponse, null, 1500);
-        // Don't auto-show menu after greeting
-        return;
-      }
-    }
-    
-    // Basic responses if AI service is down
-    if (userText.toLowerCase().includes('menu')) {
-      // open menu panel instead of listing items in chat
-      openMenuPanel();
-      addMessage('assistant', 'Opening the menu for you.', null, 1500);
-    } else if (lowerText.includes('cart')) {
-      if (cartItems.length === 0) {
-        addMessage('assistant', 'Your cart is currently empty.', null, 1500);
-      } else {
-        let cartText = 'Here are the items in your cart:\n\n';
-        cartItems.forEach(item => {
-          cartText += `- ${item.name} - $${item.price} x ${item.quantity} = $${item.totalPrice || (item.price * item.quantity)}\n`;
-        });
-        cartText += `\nTotal: $${cartItems.reduce((sum, item) => sum + (item.totalPrice || (item.price * item.quantity)), 0)}`;
-        addMessage('assistant', cartText, null, 1500);
-      }
-    } else if (userText.toLowerCase().includes('checkout')) {
-      if (cartItems.length === 0) {
-        addMessage('assistant', 'Your cart is empty. Please add items to your cart before checking out.', null, 1500);
-      } else {
-        // Simulate checkout process
-        addMessage('assistant', 'Processing your order...', null, 1500);
-        setTimeout(() => {
-          addMessage('assistant', 'Your order has been placed successfully! Thank you for choosing us.', null, 1500);
-          dispatch(clearCart());
-        }, 2000);
-      }
-    } else {
-      addMessage('assistant', 'I\'m sorry, I couldn\'t understand that. Could you please rephrase your request?', null, 1500);
-    }
-  };
+  
   
   // Improved item name matcher: stronger normalization, token singularization, and token-overlap scoring.
   // Helper: normalize text for comparisons
@@ -1184,44 +1155,112 @@ const ChatBot = ({ isOpen, onClose }) => {
     return null;
   };
 
+  const _tokens = (s = '') => _normalize(s).split(' ').filter(Boolean);
+  const _score = (a, b) => {
+    const common = a.filter(t => b.includes(t)).length;
+    const precision = common / (a.length || 1);
+    const recall = common / (b.length || 1);
+    return precision * 0.7 + recall * 0.3;
+  };
+  const findCartItemsByName = (name) => {
+    const targetNorm = _normalize(name || '');
+    const tTok = targetNorm.split(' ').filter(Boolean);
+    const results = [];
+    for (const ci of cartItems) {
+      const ciNorm = _normalize(ci.name || '');
+      const ciTok = ciNorm.split(' ').filter(Boolean);
+      const score = _score(tTok, ciTok);
+      const strong = score >= 0.5;
+      const loose = score >= 0.3 || ciNorm.includes(targetNorm) || targetNorm.includes(ciNorm);
+      if (strong || loose) {
+        results.push({ item: ci, score: Math.max(score, loose ? 0.3 : score) });
+      }
+    }
+    return results.sort((a, b) => b.score - a.score).map(x => x.item);
+  };
+
   // Parse item/quantity pairs from free text with greedy merging so multi-word items like
   // "Fish and Chips" are preserved.
   const parseItemsFromText = (text = '') => {
     if (!text) return [];
     const results = [];
+    
+    console.log('🔍 parseItemsFromText input:', text);
+    
+    // Convert word numbers to digits first ("two pizzas" -> "2 pizzas")
+    text = text.replace(/\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|a|an)\b/gi, 
+      (match) => {
+        const wordToNumber = {
+          'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+          'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10,
+          'eleven': 11, 'twelve': 12, 'thirteen': 13, 'fourteen': 14, 'fifteen': 15,
+          'sixteen': 16, 'seventeen': 17, 'eighteen': 18, 'nineteen': 19, 'twenty': 20,
+          'a': 1, 'an': 1
+        };
+        const num = wordToNumber[match.toLowerCase()];
+        return num !== undefined ? num.toString() : match;
+      });
+    
+    console.log('🔍 After word-to-number conversion:', text);
 
     // normalize quick helper
     const quickNorm = s => _normalize(s);
+
+    // Filter out common voice command words that aren't food items
+    const commandWords = /^(to|the|some|please|can|i|want|would|like|order|add|give|me|my|get|need|more)$/i;
+    const cleanItemName = (name) => {
+      return name.split(/\s+/)
+        .filter(word => !commandWords.test(word))
+        .join(' ')
+        .trim();
+    };
 
     // 1) explicit quantity patterns like "2 Fish and Chips" or "1 Grilled Salmon"
     const qtyRegex = /(\d+)\s+([A-Za-z0-9&'’\-\s]+?)(?=(?:\s+(?:and|,|&)\s+\d|\s*$|[.,!?]))/gi;
     let m;
     while ((m = qtyRegex.exec(text)) !== null) {
       const qty = parseInt(m[1], 10) || 1;
-      const name = m[2].trim().replace(/[.,!?]$/, '');
-      if (name) results.push({ name, quantity: qty });
-    }
-    if (results.length > 0) return results;
-
-    // 2) try "I want X and Y" style without explicit numbers
-    const wantsMatch = text.match(/(?:i want|i'd like|i would like|order|add|i want to order)\s+(.+)$/i);
-    if (wantsMatch) {
-      const raw = wantsMatch[1].trim().replace(/[.?!]$/, '');
-      // If whole phrase exactly matches a menu item treat as single item
-      const wholeMatch = menuData?.menuItems?.some(it => quickNorm(it.name) === quickNorm(raw));
-      if (wholeMatch) {
-        // detect leading number if present
-        const leadingNum = raw.match(/^\s*(\d+)\s+(.*)$/);
-        if (leadingNum) {
-          results.push({ name: leadingNum[2].trim(), quantity: parseInt(leadingNum[1], 10) || 1 });
-        } else {
-          results.push({ name: raw, quantity: 1 });
+      let name = m[2].trim().replace(/[.,!?]$/, '');
+      name = cleanItemName(name); // Clean command words
+      if (name && name.length > 2) { // Ensure name is meaningful
+        const menuItem = findMenuItemByName(name);
+        if (menuItem) {
+          results.push({ name: menuItem.name, quantity: qty });
         }
-        return results;
+      }
+    }
+    if (results.length > 0) {
+      console.log('✅ parseItemsFromText results (pattern 1):', results);
+      return results;
+    }
+
+    // 2) try "I want X and Y" style without explicit numbers (also handles remove, increase, decrease)
+    const wantsMatch = text.match(/(?:i want|i'd like|i would like|order|add|remove|delete|increase|decrease|reduce|i want to order|to order)\s+(.+)$/i);
+    if (wantsMatch) {
+      let raw = wantsMatch[1].trim().replace(/[.?!]$/, '');
+      
+      // Extract quantity BEFORE cleaning (e.g., "2 pizzas" -> qty=2, name="pizzas")
+      const leadingNumBeforeClean = raw.match(/^\s*(\d+)\s+(.*)$/);
+      const extractedQty = leadingNumBeforeClean ? (parseInt(leadingNumBeforeClean[1], 10) || 1) : 1;
+      const nameAfterQty = leadingNumBeforeClean ? leadingNumBeforeClean[2] : raw;
+      
+      // Now clean the item name (removes command words)
+      const cleanedName = cleanItemName(nameAfterQty);
+      
+      if (!cleanedName || cleanedName.length < 2) return []; // Skip if cleaned text is too short
+      
+      // If whole phrase exactly matches a menu item treat as single item
+      const wholeMatch = menuData?.menuItems?.some(it => quickNorm(it.name) === quickNorm(cleanedName));
+      if (wholeMatch) {
+        const menuItem = findMenuItemByName(cleanedName);
+        if (menuItem) {
+          results.push({ name: menuItem.name, quantity: extractedQty });
+          return results;
+        }
       }
 
       // split on separators but then greedily merge adjacent parts to match menu items
-      const parts = raw.split(/\s+(?:and|&|,)\s+/i).map(p => p.trim()).filter(Boolean);
+      const parts = cleanedName.split(/\s+(?:and|&|,)\s+/i).map(p => p.trim()).filter(Boolean);
 
       const consumed = new Array(parts.length).fill(false);
       for (let i = 0; i < parts.length; i++) {
@@ -1231,57 +1270,142 @@ const ChatBot = ({ isOpen, onClose }) => {
         let matched = false;
         for (let len = parts.length - i; len >= 1; len--) {
           const candidate = parts.slice(i, i + len).join(' and '); // preserve 'and' inside candidate phrase
-          // if candidate has leading number, separate it
+          // if candidate has leading number, separate it BEFORE cleaning
           const lead = candidate.match(/^\s*(\d+)\s+(.+)$/);
-          const candName = lead ? lead[2].trim() : candidate;
-          const candQty = lead ? (parseInt(lead[1], 10) || 1) : 1;
+          const candQty = lead ? (parseInt(lead[1], 10) || 1) : extractedQty; // Use extractedQty as fallback
+          let candName = lead ? lead[2].trim() : candidate;
+          candName = cleanItemName(candName); // Clean command words AFTER extracting quantity
 
-          const menuItem = findMenuItemByName(candName);
-          if (menuItem) {
-            results.push({ name: menuItem.name, quantity: candQty });
-            for (let k = i; k < i + len; k++) consumed[k] = true;
-            matched = true;
-            break;
+          if (candName && candName.length > 2) {
+            const menuItem = findMenuItemByName(candName);
+            if (menuItem) {
+              results.push({ name: menuItem.name, quantity: candQty });
+              for (let k = i; k < i + len; k++) consumed[k] = true;
+              matched = true;
+              break;
+            }
           }
         }
         if (!matched) {
-          // no menu match for any merge starting at i -> take single part as fallback
-          const single = parts[i].replace(/^\d+\s+/, '').replace(/[.?!]$/, '').trim();
-          if (single) {
+          // no menu match for any merge starting at i -> try single part
+          const singlePart = parts[i];
+          // Extract quantity from this part BEFORE cleaning
+          const partLead = singlePart.match(/^\s*(\d+)\s+(.+)$/);
+          const partQty = partLead ? (parseInt(partLead[1], 10) || 1) : extractedQty;
+          let single = partLead ? partLead[2] : singlePart;
+          single = single.replace(/[.?!]$/, '').trim();
+          single = cleanItemName(single); // Clean command words AFTER extracting quantity
+          
+          if (single && single.length > 2) {
             const menuItem = findMenuItemByName(single);
             if (menuItem) {
-              // detect quantity in the single part
-              const lead = parts[i].match(/^\s*(\d+)\s+(.+)$/);
-              const qty = lead ? (parseInt(lead[1], 10) || 1) : 1;
-              results.push({ name: menuItem.name, quantity: qty });
-            } else {
-              // keep raw fallback so later logic can prompt user or open menu
-              results.push({ name: single, quantity: 1 });
+              results.push({ name: menuItem.name, quantity: partQty });
             }
+            // Don't add garbage to results if not found in menu
             consumed[i] = true;
           }
         }
       }
 
+      if (results.length > 0) {
+        console.log('✅ parseItemsFromText results (pattern 2):', results);
+      }
       return results;
     }
 
-    // 3) last fallback "add X" pattern
-    const singleAdd = text.match(/\badd\s+(?:\b(\d+)\b\s*)?(.+?)(?:[.?!]|$)/i);
+    // 3) Fallback patterns for specific actions (add, remove, increase, decrease)
+    // Try "add X more Y" or "add X Y" pattern
+    const singleAdd = text.match(/\b(?:add)\s+(?:\b(\d+)\b\s*)?(?:more\s+)?(.+?)(?:[.?!]|$)/i);
     if (singleAdd) {
       const qty = parseInt(singleAdd[1], 10) || 1;
-      const itemName = singleAdd[2].trim().replace(/[.?!]$/, '').trim();
-      // try greedy candidate matching over the full itemName to avoid splitting
-      const menuItem = findMenuItemByName(itemName);
-      if (menuItem) {
-        results.push({ name: menuItem.name, quantity: qty });
-      } else {
-        results.push({ name: itemName, quantity: qty });
+      let itemName = singleAdd[2].trim().replace(/[.?!]$/, '').trim();
+      itemName = cleanItemName(itemName);
+      
+      console.log('🔍 singleAdd pattern matched - qty:', qty, 'itemName:', itemName);
+      
+      if (itemName && itemName.length > 2) {
+        const menuItem = findMenuItemByName(itemName);
+        if (menuItem) {
+          console.log('✅ Found menu item:', menuItem.name, 'with qty:', qty);
+          results.push({ name: menuItem.name, quantity: qty });
+        }
       }
+      if (results.length > 0) {
+        console.log('✅ parseItemsFromText results (add pattern):', results);
+      }
+      return results;
     }
-
+    
+    // Try "remove X more Y" or "remove X Y" pattern
+    const singleRemove = text.match(/\b(?:remove|delete)\s+(?:\b(\d+)\b\s*)?(?:more\s+)?(.+?)(?:[.?!]|$)/i);
+    if (singleRemove) {
+      const qty = parseInt(singleRemove[1], 10) || 1;
+      let itemName = singleRemove[2].trim().replace(/[.?!]$/, '').trim();
+      itemName = cleanItemName(itemName);
+      
+      console.log('🔍 singleRemove pattern matched - qty:', qty, 'itemName:', itemName);
+      
+      if (itemName && itemName.length > 2) {
+        const menuItem = findMenuItemByName(itemName);
+        if (menuItem) {
+          console.log('✅ Found menu item for removal:', menuItem.name, 'with qty:', qty);
+          results.push({ name: menuItem.name, quantity: qty, action: 'remove' });
+        }
+      }
+      if (results.length > 0) {
+        console.log('✅ parseItemsFromText results (remove pattern):', results);
+      }
+      return results;
+    }
+    
+    // Try "increase X by Y" or "increase X" or "add more X" pattern
+    const singleIncrease = text.match(/\b(?:increase|add\s+more)\s+(?:\b(\d+)\b\s*)?(?:more\s+)?(.+?)(?:\s+by\s+(\d+))?(?:[.?!]|$)/i);
+    if (singleIncrease) {
+      let itemName = singleIncrease[2].trim().replace(/[.?!]$/, '').trim();
+      // Quantity can be either before item name or after "by"
+      const qtyBefore = parseInt(singleIncrease[1], 10);
+      const qtyAfter = parseInt(singleIncrease[3], 10);
+      const qty = qtyAfter || qtyBefore || 1;
+      itemName = cleanItemName(itemName);
+      
+      console.log('🔍 singleIncrease pattern matched - qty:', qty, 'itemName:', itemName);
+      
+      if (itemName && itemName.length > 2) {
+        const menuItem = findMenuItemByName(itemName);
+        if (menuItem) {
+          console.log('✅ Found menu item for increase:', menuItem.name, 'with qty:', qty);
+          results.push({ name: menuItem.name, quantity: qty, action: 'increase' });
+        }
+      }
+      if (results.length > 0) {
+        console.log('✅ parseItemsFromText results (increase pattern):', results);
+      }
+      return results;
+    }
+    
+    // Try "decrease X by Y" or "decrease X" pattern  
+    const singleDecrease = text.match(/\b(?:decrease|reduce|remove some)\s+(.+?)(?:\s+by\s+(\d+))?(?:[.?!]|$)/i);
+    if (singleDecrease) {
+      let itemName = singleDecrease[1].trim().replace(/[.?!]$/, '').trim();
+      const qty = parseInt(singleDecrease[2], 10) || 1;
+      itemName = cleanItemName(itemName);
+      
+      if (itemName && itemName.length > 2) {
+        const menuItem = findMenuItemByName(itemName);
+        if (menuItem) {
+          results.push({ name: menuItem.name, quantity: qty, action: 'decrease' });
+        }
+      }
+      return results;
+    }
+    
+    console.log('⚠️ parseItemsFromText: No patterns matched, returning empty');
     return results;
   };
+
+  if (typeof window !== 'undefined') {
+    window.__parseItemsForDebug = parseItemsFromText;
+  }
 
   // NEW: signal the rest of the app to open the menu panel (category optional)
   const openMenuPanel = (category = null) => {
@@ -1294,13 +1418,6 @@ const ChatBot = ({ isOpen, onClose }) => {
     }
   };
 
-  const showMenuCategories = () => {
-    // Don't render category/item lists in-chat anymore.
-    // Instead, open the menu panel in the app and post a short helper message.
-    openMenuPanel(null);
-    addMessage('assistant', 'Opening the menu for you. Browse categories and items in the menu panel.', null, 1500);
-  };
-  
   const handleCategoryClick = (categoryName) => {
     // Add user message showing they clicked the category
     addMessage('user', `Show me ${categoryName}`);
@@ -1311,39 +1428,13 @@ const ChatBot = ({ isOpen, onClose }) => {
       addMessage('assistant', `Opening the ${categoryName} category in the menu panel.`, null, 500);
     }, 500);
   };
+
+  // Update the ref whenever handleUserInput changes (which depends on cartItems, etc.)
+  useEffect(() => {
+    handleUserInputRef.current = handleUserInput;
+  }, [handleUserInput]);
   
-  // ...existing code...
 
-  const handleMultiCategoryItemClick = (item, contentData) => {
-    // Add the selected item to cart (quantity default 1)
-    dispatch(addToCart({
-      id: item.id,
-      name: item.name,
-      price: item.price,
-      quantity: item.quantity || 1
-    }));
-
-    // Build a short assistant response
-    const response = `Added ${item.quantity || 1} ${item.name} to your cart.`;
-
-    // If there are additional categories to process, advance the multi-category flow
-    const nextIndex = (contentData && typeof contentData.currentIndex === 'number') ? contentData.currentIndex + 1 : null;
-    if (nextIndex !== null && contentData.totalCategories && nextIndex < contentData.totalCategories) {
-      const nextCategory = contentData.categories[nextIndex];
-      // Update bulk mode state so other parts of the app know progress
-      setMultiCategoryBulkMode({
-        categories: contentData.categories,
-        currentIndex: nextIndex
-      });
-
-      // Open next category in the menu panel and inform the user
-      openMenuPanel(nextCategory.category);
-      addMessage('assistant', `Opening ${nextCategory.category} in the menu panel so you can pick ${nextCategory.quantity} items.`, null, 1500);
-    } else {
-      // Finalize the flow with a confirmation message and optional preview of the item
-      addMessage('assistant', response, item, 1000);
-    }
-  };
 
   if (!isOpen) return null;
 
@@ -1370,7 +1461,8 @@ const ChatBot = ({ isOpen, onClose }) => {
                 )}
               </div>
               <p className="text-xs opacity-90">
-                {isListening ? 'Listening...' : 
+                {isSpeaking ? '🔊 Speaking...' :
+                 isListening ? 'Listening...' : 
                  isProcessing ? 'Processing...' : 
                  isTyping ? (empathyLevel === 'high' ? 'Thinking of you' : 'Assistant is typing...') : // Update typing indicator text
                  aiServiceStatus === 'connected' ? 
@@ -1381,6 +1473,35 @@ const ChatBot = ({ isOpen, onClose }) => {
             </div>
           </div>
           <div className="flex items-center space-x-2">
+            {/* Voice Response Toggle */}
+            <button
+              onClick={() => {
+                setVoiceEnabled(!voiceEnabled);
+                if (voiceEnabled) {
+                  stopSpeaking();
+                }
+              }}
+              className={`text-white hover:bg-white hover:bg-opacity-20 rounded-full p-1 transition-colors ${
+                isSpeaking ? 'animate-pulse' : ''
+              }`}
+              title={voiceEnabled ? 'Voice responses enabled (click to disable)' : 'Voice responses disabled (click to enable)'}
+            >
+              {voiceEnabled ? (
+                isSpeaking ? (
+                  <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>
+                  </svg>
+                ) : (
+                  <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/>
+                  </svg>
+                )
+              ) : (
+                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                  <path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/>
+                </svg>
+              )}
+            </button>
             <button
               onClick={handleClearChat}
               className="text-white hover:bg-white hover:bg-opacity-20 rounded-full p-1 transition-colors"
@@ -1433,34 +1554,44 @@ const ChatBot = ({ isOpen, onClose }) => {
                     <div>
                       {(() => {
                         const cartContent = message.menuItem || message.content;
+                        console.log('🛒 Rendering cart_confirm, cartContent:', cartContent);
                         // Guard rendering: ensure CartMessage receives the expected shape
-                        if (cartContent && Array.isArray(cartContent.items) && cartContent.items.length > 0) {
+                        if (cartContent && cartContent.items && Array.isArray(cartContent.items) && cartContent.items.length > 0) {
                           return <CartMessage content={cartContent} />;
                         }
                         // Fallback UI if cart/receipt is missing or empty (prevents crashes)
                         return (
                           <div className="text-sm text-gray-700">
-                            Cart summary unavailable. Please open the menu to review items.
+                            Your cart is empty. Please add items before placing an order.
                           </div>
                         );
                       })()}
-                      <div className="mt-3 flex space-x-2">
-                        <button
-                          type="button"
-                          onClick={handleConfirmPlaceOrder}
-                          disabled={isProcessing}
-                          className="px-3 py-2 bg-green-600 text-white rounded-md text-sm disabled:opacity-50 disabled:cursor-not-allowed"
-                        >
-                          Yes — place order
-                        </button>
-                        <button
-                          type="button"
-                          onClick={handleCancelPlaceOrder}
-                          className="px-3 py-2 bg-gray-200 text-gray-800 rounded-md text-sm"
-                        >
-                          Cancel
-                        </button>
-                      </div>
+                      {(() => {
+                        const cartContent = message.menuItem || message.content;
+                        // Only show buttons if cart has items
+                        if (cartContent && cartContent.items && Array.isArray(cartContent.items) && cartContent.items.length > 0) {
+                          return (
+                            <div className="mt-3 flex space-x-2">
+                              <button
+                                type="button"
+                                onClick={handleConfirmPlaceOrder}
+                                disabled={isProcessing}
+                                className="px-3 py-2 bg-green-600 text-white rounded-md text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                              >
+                                Yes — place order
+                              </button>
+                              <button
+                                type="button"
+                                onClick={handleCancelPlaceOrder}
+                                className="px-3 py-2 bg-gray-200 text-gray-800 rounded-md text-sm"
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          );
+                        }
+                        return null;
+                      })()}
                     </div>
                   ) : (
                     <>
@@ -1514,6 +1645,24 @@ const ChatBot = ({ isOpen, onClose }) => {
                     <div className="w-2 h-2 bg-primary-600 rounded-full typing-dot"></div>
                     <div className="w-2 h-2 bg-primary-600 rounded-full typing-dot"></div>
                     <div className="w-2 h-2 bg-primary-600 rounded-full typing-dot"></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+          
+          {/* Speaking indicator */}
+          {isSpeaking && (
+            <div className="flex justify-start">
+              <div className="max-w-[80%] rounded-lg p-3 bg-blue-50 text-blue-800 shadow-sm border-2 border-blue-200">
+                <div className="flex items-center space-x-2">
+                  <span className="text-sm">🔊 Speaking...</span>
+                  <div className="flex space-x-1">
+                    <div className="w-1 h-3 bg-blue-600 rounded-full animate-pulse"></div>
+                    <div className="w-1 h-4 bg-blue-600 rounded-full animate-pulse" style={{animationDelay: '0.1s'}}></div>
+                    <div className="w-1 h-5 bg-blue-600 rounded-full animate-pulse" style={{animationDelay: '0.2s'}}></div>
+                    <div className="w-1 h-4 bg-blue-600 rounded-full animate-pulse" style={{animationDelay: '0.3s'}}></div>
+                    <div className="w-1 h-3 bg-blue-600 rounded-full animate-pulse" style={{animationDelay: '0.4s'}}></div>
                   </div>
                 </div>
               </div>
@@ -1575,13 +1724,34 @@ const ChatBot = ({ isOpen, onClose }) => {
                     <div className="absolute inset-0 rounded-full border-4 border-white border-opacity-30 animate-ping"></div>
                   )}
                 </button>
+                
+                {/* Stop Speaking Button */}
+                {isSpeaking && (
+                  <button
+                    onClick={stopSpeaking}
+                    className="w-12 h-12 rounded-full flex items-center justify-center bg-blue-500 hover:bg-blue-600 text-white shadow-lg transition-all transform hover:scale-105"
+                    title="Stop speaking"
+                  >
+                    <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 24 24">
+                      <path d="M6 6h12v12H6z"/>
+                    </svg>
+                  </button>
+                )}
               </div>
               
               <p className="text-center text-sm text-gray-600 mt-2">
-                {isListening ? 'Listening to your order...' : 
+                {isSpeaking ? 'Assistant is speaking (tap square to stop)' :
+                 isListening ? 'Listening to your order...' : 
                  isProcessing ? 'Processing your request...' : 
                  'Tap to speak your order'}
               </p>
+              
+              {/* Voice response status */}
+              <div className="text-center mt-2">
+                <span className={`text-xs ${voiceEnabled ? 'text-green-600' : 'text-gray-400'}`}>
+                  {voiceEnabled ? '🔊 Voice responses ON' : '🔇 Voice responses OFF'}
+                </span>
+              </div>
               
               {/* Browser compatibility warning */}
               {typeof window !== 'undefined' && !('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) && (
