@@ -16,7 +16,7 @@ base_url = os.getenv("OPENAI_BASE_URL")
 api_key = os.getenv("GITHUB_TOKEN")
 
 print(f"Base URL: {base_url}")
-print(f"API Key (first 20 chars): {api_key[:20]}..." if api_key else "No API Key")
+print(f"API Key (first 20 chars): {api_key[:5]}..." if api_key else "No API Key")
 
 for model in models_to_test:
     try:

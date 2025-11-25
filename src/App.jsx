@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Provider, useSelector, useDispatch } from 'react-redux';
 import { ApolloProvider } from '@apollo/client';
-import { BrowserRouter as Router, Routes, Route, useNavigate, useLocation } from 'react-router-dom';
+import { BrowserRouter as Router, Routes, Route, useLocation } from 'react-router-dom';
 import store from './store';
 import client from './apollo/client';
 import Header from './components/Header';
@@ -60,7 +60,7 @@ const MainWebsite = () => {
 const AppContent = () => {
   const dispatch = useDispatch();
   const { showAdmin } = useSelector((state) => state.ui);
-  const navigate = useNavigate();
+  // const navigate = useNavigate();
   const location = useLocation();
   
   // Handle admin state synchronization with URL
